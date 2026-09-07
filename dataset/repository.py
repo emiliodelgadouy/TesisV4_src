@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from src.dataset.target import BIRADS_NEGATIVE, BIRADS_POSITIVE, cls_from_birads
 
 _EXTRACT_MARKER_NAME = ".extract_complete"
 _PROGRESS_EVERY_S = 5.0
+_PARALLEL_MIN_BYTES = 64 * 1024 * 1024
+_PARALLEL_PARTS = 8
 
 
 class DatasetRepository:
@@ -40,7 +43,13 @@ class DatasetRepository:
         return f"{n} B"
 
     def _download_from_gcs(self, source: str, destination_file: Path) -> None:
-        """Baja un objeto GCS. En Colab prioriza gsutil (rebanadas paralelas); si no, curl; si no, requests."""
+        """Baja un objeto GCS público.
+
+        En Colab ``gsutil`` falla si usa las credenciales de la VM: esa identidad
+        no tiene IAM en el bucket, aunque el objeto sea público. Se fuerza un
+        entorno anónimo (HOME / CLOUDSDK_CONFIG aislados). Si gsutil no corre,
+        sigue ``gcloud storage`` y después curl en paralelo por HTTPS.
+        """
         destination_file.parent.mkdir(parents=True, exist_ok=True)
         url = self._gcs_uri_to_https(source)
         partial = destination_file.with_name(destination_file.name + ".partial")
@@ -48,7 +57,12 @@ class DatasetRepository:
             partial.unlink()
         print(f"GET {url}", flush=True)
 
-        ok = self._download_with_gsutil(source, partial) or self._download_with_curl(url, partial)
+        ok = (
+            self._download_with_gsutil(source, partial)
+            or self._download_with_gcloud_storage(source, partial)
+            or self._download_with_curl_parallel(url, partial)
+            or self._download_with_curl(url, partial)
+        )
         if not ok:
             self._download_with_requests(url, partial)
         if not partial.is_file() or partial.stat().st_size == 0:
@@ -57,30 +71,225 @@ class DatasetRepository:
         print(f"Guardado {destination_file} ({self._format_bytes(destination_file.stat().st_size)})", flush=True)
 
     @staticmethod
-    def _download_with_gsutil(source: str, destination_file: Path) -> bool:
+    def _anonymous_gcs_env(tmp: Path) -> dict[str, str]:
+        """Entorno sin credenciales de Colab/gcloud, para objetos públicos."""
+        home = tmp / "home"
+        config = tmp / "gcloud"
+        home.mkdir()
+        config.mkdir()
+        boto = tmp / "boto"
+        boto.write_text(
+            "[Boto]\n"
+            "https_validate_certificates = True\n"
+            "[GSUtil]\n"
+            "sliced_object_download_threshold = 150M\n"
+            "sliced_object_download_max_components = 8\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        for key in (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN",
+            "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+            "CLOUDSDK_CORE_ACCOUNT",
+            "CLOUDSDK_CONFIG",
+            "BOTO_CONFIG",
+            "BOTO_PATH",
+        ):
+            env.pop(key, None)
+        env["HOME"] = str(home)
+        env["CLOUDSDK_CONFIG"] = str(config)
+        env["CLOUDSDK_AUTH_DISABLE_CREDENTIALS"] = "True"
+        env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+        env["BOTO_CONFIG"] = str(boto)
+        env["BOTO_PATH"] = str(boto)
+        # Evita que el metadata de GCE/Colab inyecte la SA de la VM.
+        env["GCE_METADATA_HOST"] = "metadata.invalid"
+        env["GCE_METADATA_ROOT"] = "metadata.invalid"
+        return env
+
+    def _run_copy_with_progress(self, cmd: list[str], destination_file: Path, env: dict[str, str]) -> bool:
+        log_path = destination_file.with_name(destination_file.name + ".log")
+        with log_path.open("wb") as log_f:
+            try:
+                proc = subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT)
+            except FileNotFoundError as exc:
+                print(f"[download] no se pudo lanzar {cmd[0]}: {exc}", flush=True)
+                return False
+            last_print = time.monotonic()
+            while proc.poll() is None:
+                time.sleep(1.0)
+                now = time.monotonic()
+                if now - last_print >= _PROGRESS_EVERY_S:
+                    size = destination_file.stat().st_size if destination_file.exists() else 0
+                    print(f"[download] {self._format_bytes(size)}", flush=True)
+                    last_print = now
+            code = proc.wait()
+        if code != 0:
+            detail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
+            print(f"[download] {' '.join(cmd[:3])} exit {code}. {detail.strip()}", flush=True)
+            if destination_file.exists():
+                destination_file.unlink()
+            log_path.unlink(missing_ok=True)
+            return False
+        log_path.unlink(missing_ok=True)
+        return destination_file.is_file() and destination_file.stat().st_size > 0
+
+    def _download_with_gsutil(self, source: str, destination_file: Path) -> bool:
         gsutil = shutil.which("gsutil")
         if gsutil is None:
             return False
-        # Rebanadas paralelas: el tar es un objeto compuesto (~8 GB, 17 componentes).
-        cmd = [
-            gsutil,
-            "-o",
-            "GSUtil:sliced_object_download_threshold=150M",
-            "-o",
-            "GSUtil:sliced_object_download_max_components=8",
-            "cp",
-            source,
-            str(destination_file),
-        ]
-        print("[download] gsutil cp (rebanadas paralelas)", flush=True)
-        try:
-            subprocess.run(cmd, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError, OSError) as exc:
-            print(f"[download] gsutil no disponible, pruebo curl: {exc}", flush=True)
-            if destination_file.exists():
-                destination_file.unlink()
+        print("[download] gsutil anónimo (rebanadas, sin credenciales Colab)", flush=True)
+        with tempfile.TemporaryDirectory(prefix="gcs-anon-") as tmp:
+            env = self._anonymous_gcs_env(Path(tmp))
+            cmd = [
+                gsutil,
+                "-o",
+                "GSUtil:sliced_object_download_threshold=150M",
+                "-o",
+                "GSUtil:sliced_object_download_max_components=8",
+                "cp",
+                source,
+                str(destination_file),
+            ]
+            return self._run_copy_with_progress(cmd, destination_file, env)
+
+    def _download_with_gcloud_storage(self, source: str, destination_file: Path) -> bool:
+        gcloud = shutil.which("gcloud")
+        if gcloud is None:
             return False
-        return destination_file.is_file() and destination_file.stat().st_size > 0
+        print("[download] gcloud storage cp anónimo", flush=True)
+        with tempfile.TemporaryDirectory(prefix="gcs-anon-") as tmp:
+            env = self._anonymous_gcs_env(Path(tmp))
+            cmd = [
+                gcloud,
+                "storage",
+                "cp",
+                source,
+                str(destination_file),
+                "--sliced-object-download-threshold=150Mi",
+                "--sliced-object-download-max-components=8",
+            ]
+            return self._run_copy_with_progress(cmd, destination_file, env)
+
+    def _https_size_and_ranges(self, url: str) -> tuple[int, bool]:
+        import requests  # type: ignore
+
+        response = requests.head(url, timeout=30, allow_redirects=True)
+        response.raise_for_status()
+        size = int(response.headers.get("content-length") or 0)
+        accept = response.headers.get("accept-ranges", "").lower()
+        return size, accept == "bytes"
+
+    @staticmethod
+    def _byte_ranges(size: int, parts: int) -> list[tuple[int, int]]:
+        parts = max(1, min(parts, size))
+        chunk = size // parts
+        ranges: list[tuple[int, int]] = []
+        start = 0
+        for index in range(parts):
+            end = size - 1 if index == parts - 1 else start + chunk - 1
+            ranges.append((start, end))
+            start = end + 1
+        return ranges
+
+    def _download_with_curl_parallel(self, url: str, destination_file: Path, *, parts: int = _PARALLEL_PARTS) -> bool:
+        curl = shutil.which("curl")
+        if curl is None:
+            return False
+        try:
+            size, supports_ranges = self._https_size_and_ranges(url)
+        except Exception as exc:
+            print(f"[download] HEAD fallo, curl simple: {exc}", flush=True)
+            return False
+        if size < _PARALLEL_MIN_BYTES or not supports_ranges:
+            return False
+
+        ranges = self._byte_ranges(size, parts)
+        parts_dir = destination_file.parent / (destination_file.name + ".parts")
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir()
+        print(f"[download] curl paralelo {len(ranges)}x ({self._format_bytes(size)})", flush=True)
+
+        jobs: list[tuple[subprocess.Popen, Path, int, object, Path]] = []
+        try:
+            for index, (start, end) in enumerate(ranges):
+                part = parts_dir / f"{index:02d}"
+                err_path = parts_dir / f"{index:02d}.err"
+                err_file = err_path.open("wb")
+                proc = subprocess.Popen(
+                    [
+                        curl,
+                        "-L",
+                        "--fail",
+                        "--retry",
+                        "5",
+                        "--retry-delay",
+                        "2",
+                        "-s",
+                        "-S",
+                        "-r",
+                        f"{start}-{end}",
+                        "-o",
+                        str(part),
+                        url,
+                    ],
+                    stderr=err_file,
+                )
+                jobs.append((proc, part, end - start + 1, err_file, err_path))
+
+            last_print = time.monotonic()
+            while True:
+                failed = [job for job in jobs if job[0].poll() not in (None, 0)]
+                running = [job for job in jobs if job[0].poll() is None]
+                now = time.monotonic()
+                if now - last_print >= _PROGRESS_EVERY_S or not running or failed:
+                    done = sum(job[1].stat().st_size if job[1].exists() else 0 for job in jobs)
+                    print(
+                        f"[download] {self._format_bytes(done)} / {self._format_bytes(size)}",
+                        flush=True,
+                    )
+                    last_print = now
+                if failed:
+                    detail = failed[0][4].read_text(encoding="utf-8", errors="replace") if failed[0][4].exists() else ""
+                    print(f"[download] curl paralelo fallo, pruebo curl simple. {detail.strip()}", flush=True)
+                    return False
+                if not running:
+                    break
+                time.sleep(1.0)
+
+            for proc, part, expected, _, err_path in jobs:
+                if proc.wait() != 0 or not part.is_file() or part.stat().st_size != expected:
+                    detail = err_path.read_text(encoding="utf-8", errors="replace") if err_path.exists() else ""
+                    print(
+                        f"[download] rango incompleto {part.name}: "
+                        f"{part.stat().st_size if part.exists() else 0} != {expected}. {detail.strip()}",
+                        flush=True,
+                    )
+                    return False
+
+            with destination_file.open("wb") as out:
+                for _, part, _, _, _ in jobs:
+                    with part.open("rb") as handle:
+                        shutil.copyfileobj(handle, out, 8 * 1024 * 1024)
+            if destination_file.stat().st_size != size:
+                print(
+                    f"[download] tamaño final {destination_file.stat().st_size} != {size}",
+                    flush=True,
+                )
+                destination_file.unlink(missing_ok=True)
+                return False
+            return True
+        finally:
+            for proc, _, _, err_file, _ in jobs:
+                try:
+                    err_file.close()
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    proc.kill()
+            shutil.rmtree(parts_dir, ignore_errors=True)
 
     @staticmethod
     def _download_with_curl(url: str, destination_file: Path) -> bool:
