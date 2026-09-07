@@ -191,7 +191,7 @@ class SplitManager:
             "n_val": int(len(val)),
             "n_test": int(len(test)),
             "random_seed": general["RANDOM_SEED"],
-            "positive_mode": general.get("POSITIVE_MODE"),
+            "positive_mode": general.get("POSITIVE_MODE") or general.get("TARGET_MODE"),
             "target_mode": TargetMode.from_config(config).name,
             "validation_split_ratio": general["VALIDATION_SPLIT_RATIO"],
             "no_finding_to_finding_ratio": general["NO_FINDING_TO_FINDING_RATIO"],
@@ -407,7 +407,7 @@ class SplitManager:
         if missing:
             raise ValueError(
                 f"Split {split_name!r}: {missing}/{len(id_df)} ids no estan en el dataset actual. "
-                "Regenera el archivo de splits o revisa POSITIVE_MODE / reduce."
+                "Regenera el archivo de splits o revisa TARGET_MODE / reduce."
             )
         return (
             merged.sort_values("_split_order", kind="mergesort")

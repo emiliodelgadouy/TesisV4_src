@@ -56,6 +56,7 @@ class DatasetConfig:
     cls_column: str = "cls"
     cls_positive_columns: tuple[str, ...] = DEFAULT_CLS_POSITIVE_COLUMNS
     cls_positive_value: int = 1
+    birads_column: str = "breast_birads"
 
     @property
     def data_dir(self) -> Path:

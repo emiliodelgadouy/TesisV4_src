@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pandas as pd
 
 from src.dataset.config import DatasetConfig
+from src.dataset.target import BIRADS_NEGATIVE, BIRADS_POSITIVE, cls_from_birads, parse_breast_birads
 
 _EXTRACT_MARKER_NAME = ".extract_complete"
+_PROGRESS_EVERY_S = 5.0
 
 
 class DatasetRepository:
-    """Descarga GCS, extrae imagenes y arma el DataFrame crudo con ``cls``."""
+    """Descarga GCS, extrae imagenes y arma el DataFrame crudo con ``cls`` (BI-RADS)."""
 
     def __init__(self, config: DatasetConfig | None = None) -> None:
         self.config = config or DatasetConfig()
@@ -26,17 +31,132 @@ class DatasetRepository:
         assert uri.startswith("gs://"), f"URI GCS inválida: {uri}"
         return "https://storage.googleapis.com/" + uri[len("gs://") :]
 
-    def _download_from_gcs(self, source: str, destination_file: Path) -> None:
-        import requests  # type: ignore
+    @staticmethod
+    def _format_bytes(n: int) -> str:
+        if n >= 1_000_000_000:
+            return f"{n / 1e9:.2f} GB"
+        if n >= 1_000_000:
+            return f"{n / 1e6:.1f} MB"
+        return f"{n} B"
 
+    def _download_from_gcs(self, source: str, destination_file: Path) -> None:
+        """Baja un objeto GCS. En Colab prioriza gsutil (rebanadas paralelas); si no, curl; si no, requests."""
         destination_file.parent.mkdir(parents=True, exist_ok=True)
         url = self._gcs_uri_to_https(source)
-        print(f"GET {url}")
-        with requests.get(url, stream=True, timeout=300) as response:
+        partial = destination_file.with_name(destination_file.name + ".partial")
+        if partial.exists():
+            partial.unlink()
+        print(f"GET {url}", flush=True)
+
+        ok = self._download_with_gsutil(source, partial) or self._download_with_curl(url, partial)
+        if not ok:
+            self._download_with_requests(url, partial)
+        if not partial.is_file() or partial.stat().st_size == 0:
+            raise FileNotFoundError(f"Descarga vacia: {destination_file}")
+        partial.replace(destination_file)
+        print(f"Guardado {destination_file} ({self._format_bytes(destination_file.stat().st_size)})", flush=True)
+
+    @staticmethod
+    def _download_with_gsutil(source: str, destination_file: Path) -> bool:
+        gsutil = shutil.which("gsutil")
+        if gsutil is None:
+            return False
+        # Rebanadas paralelas: el tar es un objeto compuesto (~8 GB, 17 componentes).
+        cmd = [
+            gsutil,
+            "-o",
+            "GSUtil:sliced_object_download_threshold=150M",
+            "-o",
+            "GSUtil:sliced_object_download_max_components=8",
+            "cp",
+            source,
+            str(destination_file),
+        ]
+        print("[download] gsutil cp (rebanadas paralelas)", flush=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError) as exc:
+            print(f"[download] gsutil no disponible, pruebo curl: {exc}", flush=True)
+            if destination_file.exists():
+                destination_file.unlink()
+            return False
+        return destination_file.is_file() and destination_file.stat().st_size > 0
+
+    @staticmethod
+    def _download_with_curl(url: str, destination_file: Path) -> bool:
+        curl = shutil.which("curl")
+        if curl is None:
+            return False
+        cmd = [
+            curl,
+            "-L",
+            "--fail",
+            "--retry",
+            "5",
+            "--retry-delay",
+            "2",
+            "--progress-bar",
+            "-o",
+            str(destination_file),
+            url,
+        ]
+        print("[download] curl", flush=True)
+        try:
+            subprocess.run(cmd, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError, OSError) as exc:
+            print(f"[download] curl fallo, pruebo requests: {exc}", flush=True)
+            if destination_file.exists():
+                destination_file.unlink()
+            return False
+        return destination_file.is_file() and destination_file.stat().st_size > 0
+
+    def _download_with_requests(self, url: str, destination_file: Path) -> None:
+        import requests  # type: ignore
+
+        print("[download] requests", flush=True)
+        downloaded = 0
+        last_print = time.monotonic()
+        with requests.get(url, stream=True, timeout=60) as response:
             response.raise_for_status()
-            with destination_file.open("wb") as f:
+            total = int(response.headers.get("content-length") or 0)
+            if total:
+                print(f"[download] {self._format_bytes(total)}", flush=True)
+            with destination_file.open("wb") as handle:
                 for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-                    f.write(chunk)
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    if now - last_print >= _PROGRESS_EVERY_S:
+                        if total:
+                            print(
+                                f"[download] {self._format_bytes(downloaded)} / {self._format_bytes(total)}",
+                                flush=True,
+                            )
+                        else:
+                            print(f"[download] {self._format_bytes(downloaded)}", flush=True)
+                        last_print = now
+
+    def _extract_tar_gz(self, archive: Path, destination: Path) -> None:
+        """GNU tar es bastante mas rapido que tarfile de Python para este .tar.gz."""
+        tar_bin = shutil.which("tar")
+        if tar_bin is not None:
+            cmd = [tar_bin, "-xzf", str(archive), "-C", str(destination)]
+            version = subprocess.run([tar_bin, "--version"], capture_output=True, text=True, check=False)
+            if "GNU tar" in (version.stdout or ""):
+                cmd.extend(
+                    [
+                        "--checkpoint=2000",
+                        "--checkpoint-action=echo=[extract] checkpoint %d",
+                    ]
+                )
+            print(f"[extract] {tar_bin} -xzf {archive.name}", flush=True)
+            subprocess.run(cmd, check=True)
+            return
+        print("[extract] Python tarfile (mas lento; no hay tar en PATH)", flush=True)
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(destination)
 
     def _extract_marker_path(self) -> Path:
         return self.config.raw_img_dir / _EXTRACT_MARKER_NAME
@@ -52,28 +172,27 @@ class DatasetRepository:
             return
 
         if not config.tar_local.is_file() or config.tar_local.stat().st_size == 0:
-            print("Downloading images...")
+            print("Downloading images...", flush=True)
             self._download_from_gcs(config.gcs_images_tar, config.tar_local)
             if not config.tar_local.is_file() or config.tar_local.stat().st_size == 0:
                 raise FileNotFoundError(f"No se pudo descargar {config.tar_local}.")
-            print("Images downloaded")
+            print("Images downloaded", flush=True)
 
         if config.extract_images and not self._has_extracted_images():
-            print("Extracting images...")
-            with tarfile.open(config.tar_local, "r:gz") as tar:
-                tar.extractall(config.raw_img_dir)
+            print("Extracting images...", flush=True)
+            self._extract_tar_gz(config.tar_local, config.raw_img_dir)
             self._extract_marker_path().write_text("ok\n", encoding="utf-8")
-            print(f"Images extracted to {config.raw_img_dir}")
+            print(f"Images extracted to {config.raw_img_dir}", flush=True)
 
         if not config.csv_main.is_file() or config.csv_main.stat().st_size == 0:
-            print("Downloading CSV...")
+            print("Downloading CSV...", flush=True)
             self._download_from_gcs(config.gcs_data_csv, config.csv_main)
-            print("CSV downloaded")
+            print("CSV downloaded", flush=True)
 
         if not config.splits_local.is_file() or config.splits_local.stat().st_size == 0:
-            print("Downloading dataset splits...")
+            print("Downloading dataset splits...", flush=True)
             self._download_from_gcs(config.gcs_splits_json, config.splits_local)
-            print(f"Splits downloaded to {config.splits_local}")
+            print(f"Splits downloaded to {config.splits_local}", flush=True)
 
     def load_raw_dataframe(self) -> pd.DataFrame:
         self.ensure_downloaded()
@@ -87,16 +206,22 @@ class DatasetRepository:
         return ds_raw
 
     def add_cls_column(self, df: pd.DataFrame) -> pd.DataFrame:
-        missing_columns = [
-            column for column in self.config.cls_positive_columns if column not in df.columns
-        ]
-        if missing_columns:
-            raise KeyError(f"Faltan columnas para generar {self.config.cls_column}: {missing_columns}")
+        """``cls``: BI-RADS 1-2 -> 0, BI-RADS 3-5 -> 1. El resto queda en NA."""
+        column = self.config.birads_column
+        if column not in df.columns:
+            raise KeyError(f"Falta la columna {column} para generar {self.config.cls_column}")
 
         df = df.copy()
-        df[self.config.cls_column] = (
-            df[list(self.config.cls_positive_columns)].eq(self.config.cls_positive_value).any(axis=1)
-        ).astype("float32")
+        df["birads"] = parse_breast_birads(df[column])
+        df[self.config.cls_column] = cls_from_birads(df[column])
+        n_pos = int(df[self.config.cls_column].eq(1).sum())
+        n_neg = int(df[self.config.cls_column].eq(0).sum())
+        n_drop = int(df[self.config.cls_column].isna().sum())
+        print(
+            f"cls desde {column}: {n_neg} neg (BI-RADS {list(BIRADS_NEGATIVE)}) / "
+            f"{n_pos} pos (BI-RADS {list(BIRADS_POSITIVE)}); "
+            f"{n_drop} filas sin assessment 1-5"
+        )
         return df
 
     @staticmethod
@@ -133,16 +258,8 @@ class DatasetRepository:
         if reduced is None:
             reduced = bool(config["GENERAL"]["REDUCED_DATASET"]) if config is not None else False
         ds_raw = self.load_raw_dataframe()
-        missing_columns = [column for column in self.config.filter_columns if column not in ds_raw.columns]
-        if missing_columns:
-            raise KeyError(f"Faltan columnas para el filtrado: {missing_columns}")
-
         ds_raw = self.add_cls_column(ds_raw)
-        ds = ds_raw[
-            ds_raw[list(self.config.filter_columns)]
-            .eq(self.config.cls_positive_value)
-            .any(axis=1)
-        ].copy()
+        ds = ds_raw[ds_raw[self.config.cls_column].notna()].copy()
         if reduced:
             ds = self._sample_dataframe(ds, sample_fraction, sample_seed)
 

@@ -24,11 +24,13 @@ class DatasetPreparer:
     def build_positive_negative(self, config, ds: pd.DataFrame) -> pd.DataFrame:
         """Arma el dataset binario positivos/negativos segun ``TARGET_MODE``.
 
-        - "mass": positivos = imagenes con ``Mass==1`` (tarea "deteccion de masas").
-          Las imagenes con otro hallazgo pero sin masa se DESCARTAN (no son ni
-          positivo ni negativo limpio).
-        - "full": cualquier hallazgo cuenta como positivo (``cls==1``); no se descarta
-          ninguna fila (positivos U negativos = dataset completo).
+        ``cls`` ya viene de BI-RADS (1-2 -> 0, 3-5 -> 1). Este recorte elige que
+        filas entran al split:
+
+        - "birads" (alias legado "full"): se conservan todas las filas con assessment
+          1-5; no se descarta ninguna.
+        - "mass": positivos = imagenes con ``Mass==1``. Las imagenes BI-RADS 3-5
+          sin masa se DESCARTAN (no son ni positivo ni negativo limpio para masas).
 
         Deduplica por imagen, fuerza ``cls`` a 1.0/0.0 y quita de los negativos las
         imagenes que ya aparecen como positivas (mismo patient_id/image_id).

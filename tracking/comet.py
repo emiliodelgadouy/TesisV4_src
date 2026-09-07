@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,19 @@ from src.dataset.provider import as_tf_dataset
 COMET_API_KEY = os.environ.get("COMET_API_KEY", "")
 # Comet rechaza nombres de imagen/figura con mas de 100 caracteres.
 COMET_MAX_IMAGE_NAME_LEN = 100
+
+
+def _experiment_timestamp() -> str:
+    """Fecha/hora local con offset ISO-8601, p.ej. ``2026-09-07T12:18:00-03:00``."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _log_run_timestamp(experiment, key: str, value: str | None = None) -> str:
+    """Deja la marca de tiempo en Other y Hyperparameters (columna comparable entre runs)."""
+    stamp = value or _experiment_timestamp()
+    experiment.log_parameter(key, stamp)
+    experiment.log_other(key, stamp)
+    return stamp
 
 
 def login_comet(config) -> None:
@@ -122,6 +136,7 @@ def start_training_experiment(
     experiment.set_step(0)
     experiment.set_epoch(0)
     experiment.log_parameters(run_config)
+    _log_run_timestamp(experiment, "run_started_at")
     if model is not None:
         experiment.set_model_graph(model)
         _log_model_param_counts(experiment, model)
@@ -725,6 +740,7 @@ def log_test_results(
             final_weights_path=final_weights_path,
         )
 
+    _log_run_timestamp(experiment, "run_finished_at")
     url = experiment.url
     experiment.end()
     return url

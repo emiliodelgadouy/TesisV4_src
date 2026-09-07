@@ -471,6 +471,7 @@ class TrainingExperiment:
                 "view",
                 "laterality",
                 "breast_birads",
+                "birads",
                 "breast_density",
                 "density",
                 "finding_categories",
