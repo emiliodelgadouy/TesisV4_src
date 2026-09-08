@@ -21,7 +21,7 @@ def _clahe_np_uint8(image: np.ndarray, clip_limit: float, tile_grid: int) -> np.
 
 
 class ImageDecoder:
-    """Decodifica JPEG/PNG y aplica CLAHE sobre luminancia."""
+    """Decodifica JPEG/PNG. CLAHE se aplica aparte sobre luminancia."""
 
     @staticmethod
     def _decode_fallback(raw: tf.Tensor) -> tf.Tensor:

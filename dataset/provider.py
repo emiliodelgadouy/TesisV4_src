@@ -833,12 +833,6 @@ class DatasetProvider:
                 )
         else:
             full = _resize_preserving_dtype(img, [canvas_h, canvas_w])
-        if self.config.use_clahe:
-            full = ImageDecoder.apply_clahe(
-                full,
-                self.config.clahe_clip_limit,
-                self.config.clahe_tile_grid,
-            )
         full.set_shape([canvas_h, canvas_w, 3])
         return full
 
@@ -1052,6 +1046,14 @@ class DatasetProvider:
                 flipped_xmin, flipped_xmax = _flip_roi_norm_x(roi_xmin, roi_xmax)
                 roi_xmin = tf.where(flip, flipped_xmin, roi_xmin)
                 roi_xmax = tf.where(flip, flipped_xmax, roi_xmax)
+        # CLAHE sobre la mamografia original (ya lateralizada), antes de
+        # resize/canvas: tile_grid=8 sobre 224 px pierde el contraste local.
+        if self.config.use_clahe:
+            img = ImageDecoder.apply_clahe(
+                img,
+                self.config.clahe_clip_limit,
+                self.config.clahe_tile_grid,
+            )
         if TrainingMode.is_mil(self.config.mode):
             return self._make_bag(img), label
         if self.config.patch_mode:
@@ -1067,15 +1069,6 @@ class DatasetProvider:
             )
         else:
             img = _resize_preserving_dtype(img, self.config.image_size)
-        if self.config.use_clahe and not (
-            self.config.patch_mode
-            and (self.config.patch_align_to_bag_grid or self.config.patch_resize_to_bag_canvas)
-        ):
-            img = ImageDecoder.apply_clahe(
-                img,
-                self.config.clahe_clip_limit,
-                self.config.clahe_tile_grid,
-            )
             img.set_shape([self._height, self._width, 3])
         return img, label
 

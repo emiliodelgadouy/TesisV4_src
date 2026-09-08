@@ -383,8 +383,11 @@ class TrainingExperiment:
                 for stage, stage_summary in training_timer.stage_summaries.items():
                     for key, value in stage_summary.items():
                         summary[f"stage_{stage}_{key}"] = float(value)
-                if str(best_global_checkpoint["monitor"]) == "val_auc":
+                monitor_name = str(best_global_checkpoint["monitor"])
+                if monitor_name == "val_auc":
                     summary["val_best_auc"] = float(best_global_checkpoint["value"])
+                elif monitor_name == "val_pr_auc":
+                    summary["val_best_pr_auc"] = float(best_global_checkpoint["value"])
                 if prediction_paths:
                     summary["train_predictions_file"] = str(prediction_paths["train"])
                     summary["val_predictions_file"] = str(prediction_paths["val"])
