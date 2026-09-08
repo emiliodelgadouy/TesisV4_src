@@ -3,13 +3,14 @@ from __future__ import annotations
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from .base import Backbone, DEFAULT_WEIGHTS
+from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
 
 
 class CustomTinyBackbone(Backbone):
     key = "customtiny"
     input_size = (64, 64)
     default_weights = None
+    batch_size = mode_batch_sizes(simple=512, full=256, abmil=128)
 
     def preprocess_input(self, x):
         # identidad, el rescale va en el modelo

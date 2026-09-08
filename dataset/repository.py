@@ -47,8 +47,11 @@ class DatasetRepository:
 
         En Colab ``gsutil`` falla si usa las credenciales de la VM: esa identidad
         no tiene IAM en el bucket, aunque el objeto sea público. Se fuerza un
-        entorno anónimo (HOME / CLOUDSDK_CONFIG aislados). Si gsutil no corre,
-        sigue ``gcloud storage`` y después curl en paralelo por HTTPS.
+        entorno anónimo (HOME / CLOUDSDK_CONFIG aislados). El tar es un objeto
+        compuesto: sin la extensión C de crcmod, gsutil aborta el CRC32C; se
+        usa ``check_hashes=if_fast_else_skip`` y se verifica el Content-Length
+        por HTTPS. ``gcloud storage`` no acepta flags de slicing (son
+        properties). Si ninguno corre, sigue curl en paralelo por HTTPS.
         """
         destination_file.parent.mkdir(parents=True, exist_ok=True)
         url = self._gcs_uri_to_https(source)
@@ -67,6 +70,11 @@ class DatasetRepository:
             self._download_with_requests(url, partial)
         if not partial.is_file() or partial.stat().st_size == 0:
             raise FileNotFoundError(f"Descarga vacia: {destination_file}")
+        expected = self._https_content_length(url)
+        actual = partial.stat().st_size
+        if expected and actual != expected:
+            partial.unlink(missing_ok=True)
+            raise FileNotFoundError(f"Tamaño inesperado {actual} != {expected} para {destination_file}")
         partial.replace(destination_file)
         print(f"Guardado {destination_file} ({self._format_bytes(destination_file.stat().st_size)})", flush=True)
 
@@ -83,6 +91,16 @@ class DatasetRepository:
             "https_validate_certificates = True\n"
             "[GSUtil]\n"
             "sliced_object_download_threshold = 150M\n"
+            "sliced_object_download_max_components = 8\n"
+            "check_hashes = if_fast_else_skip\n",
+            encoding="utf-8",
+        )
+        (config / "properties").write_text(
+            "[core]\n"
+            "disable_usage_reporting = True\n"
+            "disable_prompts = True\n"
+            "[storage]\n"
+            "sliced_object_download_threshold = 150Mi\n"
             "sliced_object_download_max_components = 8\n",
             encoding="utf-8",
         )
@@ -148,6 +166,8 @@ class DatasetRepository:
                 "GSUtil:sliced_object_download_threshold=150M",
                 "-o",
                 "GSUtil:sliced_object_download_max_components=8",
+                "-o",
+                "GSUtil:check_hashes=if_fast_else_skip",
                 "cp",
                 source,
                 str(destination_file),
@@ -163,14 +183,20 @@ class DatasetRepository:
             env = self._anonymous_gcs_env(Path(tmp))
             cmd = [
                 gcloud,
+                "--quiet",
                 "storage",
                 "cp",
                 source,
                 str(destination_file),
-                "--sliced-object-download-threshold=150Mi",
-                "--sliced-object-download-max-components=8",
             ]
             return self._run_copy_with_progress(cmd, destination_file, env)
+
+    def _https_content_length(self, url: str) -> int:
+        try:
+            size, _ = self._https_size_and_ranges(url)
+            return size
+        except Exception:
+            return 0
 
     def _https_size_and_ranges(self, url: str) -> tuple[int, bool]:
         import requests  # type: ignore

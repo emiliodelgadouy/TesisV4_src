@@ -2,7 +2,7 @@ from tensorflow.keras.applications import VGG16, VGG19
 from tensorflow.keras.applications.vgg16 import preprocess_input as vgg16_preprocess
 from tensorflow.keras.applications.vgg19 import preprocess_input as vgg19_preprocess
 
-from .base import ImagenetBackbone
+from .base import ImagenetBackbone, mode_batch_sizes
 
 
 class VGG16Backbone(ImagenetBackbone):
@@ -10,6 +10,7 @@ class VGG16Backbone(ImagenetBackbone):
     application = VGG16
     preprocess_fn = vgg16_preprocess
     input_size = (224, 224)
+    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)
 
 
 class VGG19Backbone(ImagenetBackbone):
@@ -17,3 +18,4 @@ class VGG19Backbone(ImagenetBackbone):
     application = VGG19
     preprocess_fn = vgg19_preprocess
     input_size = (224, 224)
+    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)

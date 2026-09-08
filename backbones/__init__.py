@@ -1,4 +1,4 @@
-from .base import Backbone, DEFAULT_WEIGHTS
+from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
 from . import chexnet, custom_tiny, efficientnet, efficientnet_v2, vgg, vit, swin
 from .base import BACKBONES, get_backbone, resolve_backbone
 from .chexnet import CheXNetBackbone
@@ -52,5 +52,6 @@ __all__ = [
     "ViTS16Backbone",
     "SwinTBackbone",
     "get_backbone",
+    "mode_batch_sizes",
     "resolve_backbone",
 ]

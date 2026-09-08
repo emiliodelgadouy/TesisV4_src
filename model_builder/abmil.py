@@ -3,6 +3,17 @@ from src.model_builder.mil_base import MilModelBuilderBase
 
 
 class AbmilModelBuilder(MilModelBuilderBase):
+    # Attention-based MIL (Ilse et al.). El tiling es en dataset o en Keras segun BAG_KERAS_TILING.
+    #
+    # dataset (bag_keras_tiling=False):
+    #   +-------------+    +------------+    +---------------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #   | bag KxHxWx3 |--->| TD augment |--->| TD preprocess |--->| TD backbone |--->| TD GAP |--->| TD Dense+ReLU |--->| TD Dropout |--->| gated attn |--->| bag dropout |--->| Dense(1) logits |
+    #   +-------------+    +------------+    +---------------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #
+    # Keras (bag_keras_tiling=True):
+    #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #   | image (R*H)x(C*W)x3 |--->| augmentation |--->| preprocess |--->| BagTiling |--->| TD backbone |--->| TD GAP |--->| TD Dense+ReLU |--->| TD Dropout |--->| gated attn |--->| bag dropout |--->| Dense(1) logits |
+    #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
     model_name = "abmil"
 
     def pool_instances(self, x):
@@ -16,6 +27,18 @@ class AbmilModelBuilder(MilModelBuilderBase):
 
 
 class AbmilPatchHardnegModelBuilder(AbmilModelBuilder):
+    # Mismo grafo que ABMIL. Transfiere backbone + Dense de instancia desde patch_hardneg;
+    # el clasificador de bag se inicializa nuevo.
+    #
+    # dataset (bag_keras_tiling=False):
+    #   +-------------+    +------------+    +---------------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #   | bag KxHxWx3 |--->| TD augment |--->| TD preprocess |--->| TD backbone |--->| TD GAP |--->| TD Dense+ReLU |--->| TD Dropout |--->| gated attn |--->| bag dropout |--->| Dense(1) logits |
+    #   +-------------+    +------------+    +---------------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #
+    # Keras (bag_keras_tiling=True):
+    #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
+    #   | image (R*H)x(C*W)x3 |--->| augmentation |--->| preprocess |--->| BagTiling |--->| TD backbone |--->| TD GAP |--->| TD Dense+ReLU |--->| TD Dropout |--->| gated attn |--->| bag dropout |--->| Dense(1) logits |
+    #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
     model_name = "abmil_patch_hardneg"
 
     def build(self):

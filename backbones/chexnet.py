@@ -8,7 +8,7 @@ from tensorflow.keras import layers
 from tensorflow.keras.applications import DenseNet121
 from tensorflow.keras.applications.densenet import preprocess_input as densenet_preprocess
 
-from .base import Backbone, DEFAULT_WEIGHTS
+from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
 from .medical_weights import medical_weights_dir
 
 def download_chexnet_weights() -> Path:
@@ -24,6 +24,7 @@ class CheXNetBackbone(Backbone):
     key = "chexnet"
     input_size = (224, 224)
     default_weights = "chexnet"
+    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
 
     def preprocess_input(self, x):
         return densenet_preprocess(x)

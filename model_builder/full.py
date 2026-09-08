@@ -2,6 +2,9 @@ from src.model_builder.simple import SimpleModelBuilder
 
 
 class FullModelBuilder(SimpleModelBuilder):
-    # Igual que SIMPLE, pero con IMG_SIZE tomado de CONFIG["FULL"]["INPUT_SIZE"].
-    # No usa grilla ni bags: es un clasificador de imagen completa a mayor resolucion.
+    # Igual que SIMPLE, con IMG_SIZE de CONFIG["FULL"]["INPUT_SIZE"] (sin grilla ni bags).
+    #
+    #   +-------------+    +--------------+    +------------+    +----------+    +-----+    +------------+    +---------+    +-----------------+
+    #   | image HxWx3 |--->| augmentation |--->| preprocess |--->| backbone |--->| GAP |--->| Dense+ReLU |--->| Dropout |--->| Dense(1) logits |
+    #   +-------------+    +--------------+    +------------+    +----------+    +-----+    +------------+    +---------+    +-----------------+
     model_name = "full"

@@ -12,7 +12,7 @@ from src.dataset.splits import SplitManager
 from src.model_builder import ModelBuilder
 from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
-from src.training.mode import TrainingMode, resolve_abmil_config
+from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size
 from src.training.resources import GpuResources
 from src.training.stage_runner import TrainingStageRunner
 from src.training.timer import TrainingTimer, sample_memory_usage
@@ -77,15 +77,16 @@ class TrainingExperiment:
         )
         # FULL usa su propio INPUT_SIZE. Si falta, 3× el nativo del backbone
         # (default historico, ya no lee la grilla de ABMIL).
+        native_size = get_backbone(backbone_name).input_size
         if mode == "full":
             full_override = full_cfg.get("INPUT_SIZE")
             if full_override is not None:
                 input_size = tuple(full_override)
             else:
-                native_h, native_w = get_backbone(backbone_name).input_size
+                native_h, native_w = native_size
                 input_size = (3 * native_h, 3 * native_w)
         else:
-            input_size = None
+            input_size = native_size
 
         experiment = model = builder = backbone = dataset_provider = train_ds = val_ds = (
             ds_test
@@ -96,10 +97,15 @@ class TrainingExperiment:
         if self.experiment_suffix:
             exp_name = f"{exp_name}_{self.experiment_suffix}"
         is_mil_run = TrainingMode.is_mil(mode)
-        batch_size = (
-            abmil_cfg.get("BATCH_SIZE", general["BATCH_SIZE"])
-            if is_mil_run
-            else general["BATCH_SIZE"]
+        batch_size, batch_size_source, batch_size_base = resolve_batch_size(
+            config,
+            mode,
+            backbone_name,
+            input_size=input_size,
+            bag_grid=bag_grid,
+        )
+        print(
+            f"batch_size={batch_size} (source={batch_size_source}, base={batch_size_base})"
         )
         # Default: cache on en simple/patch; off en full/abmil (canvases grandes).
         cache_dataset = general.get("CACHE_DATASET", not is_mil_run and mode != "full")
@@ -161,6 +167,9 @@ class TrainingExperiment:
                 "INPUT_SIZE": list(input_size),
                 "TRAIN_ROWS": len(train_df),
                 "BATCH_SIZE": batch_size,
+                "BATCH_SIZE_BASE": batch_size_base,
+                "BATCH_SIZE_SOURCE": batch_size_source,
+                "USE_CUSTOM_BATCH_SIZE": bool(general.get("USE_CUSTOM_BATCH_SIZE", False)),
                 "CACHE_DATASET": cache_dataset,
                 "JIT_COMPILE": True,
                 "FOCAL_ALPHA_EFFECTIVE": focal_alpha,

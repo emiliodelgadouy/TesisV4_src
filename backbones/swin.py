@@ -8,7 +8,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from .base import Backbone, DEFAULT_WEIGHTS
+from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
 
 _SWINT_WEIGHTS_URL = "https://huggingface.co/microsoft/swin-tiny-patch4-window7-224/resolve/main/model.safetensors"
 _SWINT_WEIGHTS_MD5 = "06f626c9949735d52934bfdfe70d4e6c"
@@ -316,6 +316,7 @@ class SwinTBackbone(Backbone):
     input_size = (224, 224)
     default_weights = "imagenet"
     preprocess_fn = staticmethod(swin_preprocess_input)
+    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
 
     def preprocess_input(self, x):
         return swin_preprocess_input(x)

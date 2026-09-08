@@ -5,7 +5,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from .base import Backbone, DEFAULT_WEIGHTS
+from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
 
 # AugReg ViT-S/16 (Steiner et al.): ImageNet-21k + fine-tune ImageNet-1k a 224.
 _VITS16_WEIGHTS_URL = "https://storage.googleapis.com/vit_models/augreg/S_16-i21k-300ep-lr_0.001-aug_light1-wd_0.03-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.03-res_224.npz"
@@ -174,6 +174,9 @@ class ViTS16Backbone(Backbone):
     input_size = (224, 224)
     default_weights = "imagenet"
     preprocess_fn = staticmethod(vit_preprocess_input)
+    # FULL a 672: atencion cuadratica (~1764 tokens). ABMIL tiles a 224.
+    batch_memory_scale = "attention"
+    batch_size = mode_batch_sizes(simple=128, full=8, abmil=32)
 
     def preprocess_input(self, x):
         return vit_preprocess_input(x)

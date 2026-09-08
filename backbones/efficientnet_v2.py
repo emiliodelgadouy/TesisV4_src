@@ -9,7 +9,7 @@ from tensorflow.keras.applications import (
 )
 from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
 
-from .base import ImagenetBackbone
+from .base import ImagenetBackbone, mode_batch_sizes
 
 
 class EfficientNetV2B0Backbone(ImagenetBackbone):
@@ -17,6 +17,7 @@ class EfficientNetV2B0Backbone(ImagenetBackbone):
     application = EfficientNetV2B0
     preprocess_fn = preprocess_input
     input_size = (224, 224)
+    batch_size = mode_batch_sizes(simple=256, full=128, abmil=64)
 
 
 class EfficientNetV2B1Backbone(ImagenetBackbone):
@@ -24,6 +25,7 @@ class EfficientNetV2B1Backbone(ImagenetBackbone):
     application = EfficientNetV2B1
     preprocess_fn = preprocess_input
     input_size = (240, 240)
+    batch_size = mode_batch_sizes(simple=256, full=128, abmil=64)
 
 
 class EfficientNetV2B2Backbone(ImagenetBackbone):
@@ -31,6 +33,7 @@ class EfficientNetV2B2Backbone(ImagenetBackbone):
     application = EfficientNetV2B2
     preprocess_fn = preprocess_input
     input_size = (260, 260)
+    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
 
 
 class EfficientNetV2B3Backbone(ImagenetBackbone):
@@ -38,6 +41,7 @@ class EfficientNetV2B3Backbone(ImagenetBackbone):
     application = EfficientNetV2B3
     preprocess_fn = preprocess_input
     input_size = (300, 300)
+    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)
 
 
 class EfficientNetV2SBackbone(ImagenetBackbone):
@@ -45,6 +49,7 @@ class EfficientNetV2SBackbone(ImagenetBackbone):
     application = EfficientNetV2S
     preprocess_fn = preprocess_input
     input_size = (384, 384)
+    batch_size = mode_batch_sizes(simple=128, full=32, abmil=32)
 
 
 class EfficientNetV2MBackbone(ImagenetBackbone):
@@ -52,6 +57,7 @@ class EfficientNetV2MBackbone(ImagenetBackbone):
     application = EfficientNetV2M
     preprocess_fn = preprocess_input
     input_size = (480, 480)
+    batch_size = mode_batch_sizes(simple=64, full=16, abmil=16)
 
 
 class EfficientNetV2LBackbone(ImagenetBackbone):
@@ -59,3 +65,4 @@ class EfficientNetV2LBackbone(ImagenetBackbone):
     application = EfficientNetV2L
     preprocess_fn = preprocess_input
     input_size = (480, 480)
+    batch_size = mode_batch_sizes(simple=32, full=16, abmil=8)
