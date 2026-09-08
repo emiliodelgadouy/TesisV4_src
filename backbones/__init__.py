@@ -1,5 +1,5 @@
 from .base import Backbone, DEFAULT_WEIGHTS
-from . import chexnet, custom_tiny, efficientnet, efficientnet_v2, vgg, vit
+from . import chexnet, custom_tiny, efficientnet, efficientnet_v2, vgg, vit, swin
 from .base import BACKBONES, get_backbone, resolve_backbone
 from .chexnet import CheXNetBackbone
 from .custom_tiny import CustomTinyBackbone
@@ -24,6 +24,7 @@ from .efficientnet_v2 import (
 )
 from .vgg import VGG16Backbone, VGG19Backbone
 from .vit import ViTS16Backbone
+from .swin import SwinTBackbone
 
 __all__ = [
     "BACKBONES",
@@ -49,6 +50,7 @@ __all__ = [
     "VGG16Backbone",
     "VGG19Backbone",
     "ViTS16Backbone",
+    "SwinTBackbone",
     "get_backbone",
     "resolve_backbone",
 ]
