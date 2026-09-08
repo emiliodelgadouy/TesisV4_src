@@ -87,9 +87,15 @@ def _drop_path(x, drop_prob, training):
 
 
 class WindowAttention(layers.Layer):
-    """W-MSA con relative position bias (tabla fija al window_size, no al canvas)."""
+    """W-MSA con relative position bias (tabla fija al window_size, no al canvas).
+
+    Siempre float32: con mixed_float16 el gather 2D de la tabla + matmul de atencion
+    corrompe la VRAM en el backward (CUDA_ERROR_ILLEGAL_ADDRESS en BiasAddGrad)
+    en cuanto se descongela el bloque.
+    """
 
     def __init__(self, dim, num_heads, window_size, **kwargs):
+        kwargs.setdefault("dtype", "float32")
         super().__init__(**kwargs)
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} no es divisible por num_heads={num_heads}")
@@ -98,19 +104,22 @@ class WindowAttention(layers.Layer):
         self.window_size = window_size
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.query = layers.Dense(dim, name="query")
-        self.key = layers.Dense(dim, name="key")
-        self.value = layers.Dense(dim, name="value")
-        self.proj = layers.Dense(dim, name="proj")
+        self.query = layers.Dense(dim, name="query", dtype="float32")
+        self.key = layers.Dense(dim, name="key", dtype="float32")
+        self.value = layers.Dense(dim, name="value", dtype="float32")
+        self.proj = layers.Dense(dim, name="proj", dtype="float32")
 
     def build(self, input_shape):
         self.relative_position_bias_table = self.add_weight(
             shape=((2 * self.window_size - 1) ** 2, self.num_heads),
             initializer="zeros",
             trainable=True,
+            dtype="float32",
             name="relative_position_bias_table",
         )
-        self._relative_position_index = _relative_position_index(self.window_size)
+        # Numpy aca (no tf.constant en build): Keras construye las capas en un
+        # scratch graph y ese Const queda "out of scope" al entrenar.
+        self._relative_position_index = _relative_position_index(self.window_size).reshape(-1)
         super().build(input_shape)
 
     def _heads(self, x):
@@ -119,6 +128,7 @@ class WindowAttention(layers.Layer):
         return tf.transpose(x, [0, 2, 1, 3])
 
     def call(self, x, attn_mask=None):
+        x = tf.cast(x, tf.float32)
         seq = self.window_size * self.window_size
         query = self._heads(self.query(x))
         key = self._heads(self.key(x))
@@ -126,15 +136,15 @@ class WindowAttention(layers.Layer):
         attn = tf.matmul(query, key, transpose_b=True) * tf.cast(self.scale, query.dtype)
         index = tf.constant(self._relative_position_index, dtype=tf.int32)
         bias = tf.gather(self.relative_position_bias_table, index)
+        bias = tf.reshape(bias, [seq, seq, self.num_heads])
         bias = tf.transpose(bias, [2, 0, 1])
-        attn = attn + tf.cast(bias, attn.dtype)
+        attn = attn + bias
         if attn_mask is not None:
             num_windows = int(attn_mask.shape[0])
             attn = tf.reshape(attn, [-1, num_windows, self.num_heads, seq, seq])
             attn = attn + tf.cast(attn_mask[None, :, None, :, :], attn.dtype)
             attn = tf.reshape(attn, [-1, self.num_heads, seq, seq])
-        attn = tf.nn.softmax(tf.cast(attn, tf.float32), axis=-1)
-        attn = tf.cast(attn, value.dtype)
+        attn = tf.nn.softmax(attn, axis=-1)
         out = tf.matmul(attn, value)
         out = tf.transpose(out, [0, 2, 1, 3])
         out = tf.reshape(out, [-1, seq, self.dim])
@@ -145,16 +155,17 @@ class SwinBlock(layers.Layer):
     """Bloque pre-norm: W-MSA o SW-MSA + MLP, con drop-path."""
 
     def __init__(self, dim, num_heads, window_size, shift_size, drop_path_rate, **kwargs):
+        kwargs.setdefault("dtype", "float32")
         super().__init__(**kwargs)
         self.dim = dim
         self.window_size = window_size
         self.shift_size = int(shift_size)
         self.drop_path_rate = float(drop_path_rate)
-        self.norm1 = layers.LayerNormalization(epsilon=_LN_EPS, name="norm1")
+        self.norm1 = layers.LayerNormalization(epsilon=_LN_EPS, name="norm1", dtype="float32")
         self.attn = WindowAttention(dim, num_heads, window_size, name="attn")
-        self.norm2 = layers.LayerNormalization(epsilon=_LN_EPS, name="norm2")
-        self.mlp_fc1 = layers.Dense(int(dim * _MLP_RATIO), name="mlp_fc1")
-        self.mlp_fc2 = layers.Dense(dim, name="mlp_fc2")
+        self.norm2 = layers.LayerNormalization(epsilon=_LN_EPS, name="norm2", dtype="float32")
+        self.mlp_fc1 = layers.Dense(int(dim * _MLP_RATIO), name="mlp_fc1", dtype="float32")
+        self.mlp_fc2 = layers.Dense(dim, name="mlp_fc2", dtype="float32")
 
     def build(self, input_shape):
         height, width = int(input_shape[1]), int(input_shape[2])
@@ -191,6 +202,7 @@ class SwinBlock(layers.Layer):
         return x
 
     def call(self, x, training=False):
+        x = tf.cast(x, tf.float32)
         shortcut = x
         x = shortcut + _drop_path(self._window_attention(self.norm1(x)), self.drop_path_rate, training)
         mlp = self.mlp_fc2(keras.activations.gelu(self.mlp_fc1(self.norm2(x)), approximate=False))
@@ -201,11 +213,13 @@ class PatchMerging(layers.Layer):
     """Une parches 2x2 y proyecta 4C → 2C (downsample espacial)."""
 
     def __init__(self, dim, **kwargs):
+        kwargs.setdefault("dtype", "float32")
         super().__init__(**kwargs)
-        self.norm = layers.LayerNormalization(epsilon=_LN_EPS, name="norm")
-        self.reduction = layers.Dense(2 * dim, use_bias=False, name="reduction")
+        self.norm = layers.LayerNormalization(epsilon=_LN_EPS, name="norm", dtype="float32")
+        self.reduction = layers.Dense(2 * dim, use_bias=False, name="reduction", dtype="float32")
 
     def call(self, x):
+        x = tf.cast(x, tf.float32)
         x0 = x[:, 0::2, 0::2, :]
         x1 = x[:, 1::2, 0::2, :]
         x2 = x[:, 0::2, 1::2, :]
@@ -289,7 +303,7 @@ def build_swin_t(input_shape: tuple[int, int, int], *, weights: str | None) -> k
     dpr = [_DROP_PATH_RATE * i / max(sum(_DEPTHS) - 1, 1) for i in range(sum(_DEPTHS))]
     inputs = keras.Input(shape=input_shape, name="input")
     x = layers.Conv2D(_EMBED_DIM, _PATCH_SIZE, strides=_PATCH_SIZE, padding="valid", name="patch_embed")(inputs)
-    x = layers.LayerNormalization(epsilon=_LN_EPS, name="patch_norm")(x)
+    x = layers.LayerNormalization(epsilon=_LN_EPS, name="patch_norm", dtype="float32")(x)
     block_id = 0
     dim = _EMBED_DIM
     for stage, (depth, num_heads) in enumerate(zip(_DEPTHS, _NUM_HEADS)):
@@ -300,7 +314,7 @@ def build_swin_t(input_shape: tuple[int, int, int], *, weights: str | None) -> k
         if stage < len(_DEPTHS) - 1:
             x = PatchMerging(dim, name=f"stage{stage}_downsample")(x)
             dim *= 2
-    x = layers.LayerNormalization(epsilon=_LN_EPS, name="encoder_norm")(x)
+    x = layers.LayerNormalization(epsilon=_LN_EPS, name="encoder_norm", dtype="float32")(x)
     model = keras.Model(inputs, x, name="swint")
     if weights == "imagenet":
         _load_hf_weights(model, _download_swint_weights())
@@ -317,6 +331,7 @@ class SwinTBackbone(Backbone):
     default_weights = "imagenet"
     preprocess_fn = staticmethod(swin_preprocess_input)
     batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
+    supports_fused_train_steps = False
 
     def preprocess_input(self, x):
         return swin_preprocess_input(x)

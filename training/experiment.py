@@ -209,6 +209,8 @@ class TrainingExperiment:
                 batch_size,
                 max_steps=32,
             )
+            if not get_backbone(backbone_name).supports_fused_train_steps:
+                steps_per_execution = 1
             run_config["STEPS_PER_EXECUTION"] = steps_per_execution
 
             builder = ModelBuilder(

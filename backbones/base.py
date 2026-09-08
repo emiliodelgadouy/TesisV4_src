@@ -59,6 +59,8 @@ class Backbone:
     batch_size: ClassVar[dict[str, int]] = dict(_DEFAULT_BATCH_SIZE)
     # "spatial": activaciones ~ H×W (CNN, Swin). "attention": ~ (H×W)^2 (ViT FULL).
     batch_memory_scale: ClassVar[str] = "spatial"
+    # False: no fusionar steps en un while de tf.function (capas custom + CUDA).
+    supports_fused_train_steps: ClassVar[bool] = True
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
