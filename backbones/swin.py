@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from typing import override
 
 import numpy as np
 import tensorflow as tf
@@ -86,12 +87,27 @@ def _drop_path(x, drop_prob, training):
     return x / keep * tf.floor(random_tensor)
 
 
+def _linear(dense, tokens):
+    """Dense como matmul 2D + bias broadcast.
+
+    Keras Dense sobre (B, H, W, C) usa BiasAdd NHWC; en GPU el BiasAddGrad
+    (kernel int32) pega CUDA_ERROR_ILLEGAL_ADDRESS al descongelar Swin.
+    """
+    in_dim = int(dense.kernel.shape[0])
+    out_dim = int(dense.kernel.shape[1])
+    lead = tf.shape(tokens)[:-1]
+    flat = tf.reshape(tokens, [-1, in_dim])
+    out = tf.matmul(flat, tf.cast(dense.kernel, tokens.dtype))
+    if dense.bias is not None:
+        out = out + tf.cast(dense.bias, tokens.dtype)
+    return tf.reshape(out, tf.concat([lead, [out_dim]], axis=0))
+
+
 class WindowAttention(layers.Layer):
     """W-MSA con relative position bias (tabla fija al window_size, no al canvas).
 
-    Siempre float32: con mixed_float16 el gather 2D de la tabla + matmul de atencion
-    corrompe la VRAM en el backward (CUDA_ERROR_ILLEGAL_ADDRESS en BiasAddGrad)
-    en cuanto se descongela el bloque.
+    Siempre float32. Las Dense no se llaman como capa: BiasAddGrad sobre (B,H,W,C)
+    dispara CUDA_ERROR_ILLEGAL_ADDRESS al descongelar (etapa 2).
     """
 
     def __init__(self, dim, num_heads, window_size, **kwargs):
@@ -120,6 +136,11 @@ class WindowAttention(layers.Layer):
         # Numpy aca (no tf.constant en build): Keras construye las capas en un
         # scratch graph y ese Const queda "out of scope" al entrenar.
         self._relative_position_index = _relative_position_index(self.window_size).reshape(-1)
+        in_shape = (None, self.dim)
+        self.query.build(in_shape)
+        self.key.build(in_shape)
+        self.value.build(in_shape)
+        self.proj.build(in_shape)
         super().build(input_shape)
 
     def _heads(self, x):
@@ -130,9 +151,9 @@ class WindowAttention(layers.Layer):
     def call(self, x, attn_mask=None):
         x = tf.cast(x, tf.float32)
         seq = self.window_size * self.window_size
-        query = self._heads(self.query(x))
-        key = self._heads(self.key(x))
-        value = self._heads(self.value(x))
+        query = self._heads(_linear(self.query, x))
+        key = self._heads(_linear(self.key, x))
+        value = self._heads(_linear(self.value, x))
         attn = tf.matmul(query, key, transpose_b=True) * tf.cast(self.scale, query.dtype)
         index = tf.constant(self._relative_position_index, dtype=tf.int32)
         bias = tf.gather(self.relative_position_bias_table, index)
@@ -148,7 +169,7 @@ class WindowAttention(layers.Layer):
         out = tf.matmul(attn, value)
         out = tf.transpose(out, [0, 2, 1, 3])
         out = tf.reshape(out, [-1, seq, self.dim])
-        return self.proj(out)
+        return _linear(self.proj, out)
 
 
 class SwinBlock(layers.Layer):
@@ -180,6 +201,11 @@ class SwinBlock(layers.Layer):
         padded_h, padded_w = height + pad_h, width + pad_w
         mask = _shifted_window_mask(padded_h, padded_w, self.window_size, shift)
         self._attn_mask = mask
+        self.norm1.build((None, None, None, self.dim))
+        self.attn.build((None, self.window_size * self.window_size, self.dim))
+        self.norm2.build((None, None, None, self.dim))
+        self.mlp_fc1.build((None, self.dim))
+        self.mlp_fc2.build((None, int(self.dim * _MLP_RATIO)))
         super().build(input_shape)
 
     def _window_attention(self, x):
@@ -205,7 +231,9 @@ class SwinBlock(layers.Layer):
         x = tf.cast(x, tf.float32)
         shortcut = x
         x = shortcut + _drop_path(self._window_attention(self.norm1(x)), self.drop_path_rate, training)
-        mlp = self.mlp_fc2(keras.activations.gelu(self.mlp_fc1(self.norm2(x)), approximate=False))
+        tokens = tf.reshape(self.norm2(x), [-1, self.dim])
+        tokens = keras.activations.gelu(_linear(self.mlp_fc1, tokens), approximate=False)
+        mlp = tf.reshape(_linear(self.mlp_fc2, tokens), [-1, self._height, self._width, self.dim])
         return x + _drop_path(mlp, self.drop_path_rate, training)
 
 
@@ -215,8 +243,14 @@ class PatchMerging(layers.Layer):
     def __init__(self, dim, **kwargs):
         kwargs.setdefault("dtype", "float32")
         super().__init__(**kwargs)
+        self.dim = dim
         self.norm = layers.LayerNormalization(epsilon=_LN_EPS, name="norm", dtype="float32")
         self.reduction = layers.Dense(2 * dim, use_bias=False, name="reduction", dtype="float32")
+
+    def build(self, input_shape):
+        self.norm.build((None, None, None, 4 * self.dim))
+        self.reduction.build((None, 4 * self.dim))
+        super().build(input_shape)
 
     def call(self, x):
         x = tf.cast(x, tf.float32)
@@ -224,7 +258,8 @@ class PatchMerging(layers.Layer):
         x1 = x[:, 1::2, 0::2, :]
         x2 = x[:, 0::2, 1::2, :]
         x3 = x[:, 1::2, 1::2, :]
-        return self.reduction(self.norm(tf.concat([x0, x1, x2, x3], axis=-1)))
+        merged = self.norm(tf.concat([x0, x1, x2, x3], axis=-1))
+        return _linear(self.reduction, merged)
 
 
 def _load_safetensors(path: str) -> dict[str, np.ndarray]:
@@ -302,7 +337,7 @@ def build_swin_t(input_shape: tuple[int, int, int], *, weights: str | None) -> k
 
     dpr = [_DROP_PATH_RATE * i / max(sum(_DEPTHS) - 1, 1) for i in range(sum(_DEPTHS))]
     inputs = keras.Input(shape=input_shape, name="input")
-    x = layers.Conv2D(_EMBED_DIM, _PATCH_SIZE, strides=_PATCH_SIZE, padding="valid", name="patch_embed")(inputs)
+    x = layers.Conv2D(_EMBED_DIM, _PATCH_SIZE, strides=_PATCH_SIZE, padding="valid", name="patch_embed", dtype="float32")(inputs)
     x = layers.LayerNormalization(epsilon=_LN_EPS, name="patch_norm", dtype="float32")(x)
     block_id = 0
     dim = _EMBED_DIM
@@ -333,9 +368,11 @@ class SwinTBackbone(Backbone):
     batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
     supports_fused_train_steps = False
 
+    @override
     def preprocess_input(self, x):
         return swin_preprocess_input(x)
 
+    @override
     def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
         if include_top:
             raise ValueError("swint no implementa include_top=True; se usa como extractor espacial")

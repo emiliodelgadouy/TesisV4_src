@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import override
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -178,9 +180,11 @@ class ViTS16Backbone(Backbone):
     batch_memory_scale = "attention"
     batch_size = mode_batch_sizes(simple=128, full=8, abmil=32)
 
+    @override
     def preprocess_input(self, x):
         return vit_preprocess_input(x)
 
+    @override
     def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
         if include_top:
             raise ValueError("vits16 no implementa include_top=True; se usa como extractor espacial")

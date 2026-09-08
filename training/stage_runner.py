@@ -83,11 +83,12 @@ class TrainingStageRunner:
             callbacks=callbacks,
             training_timer=training_timer,
             stage=stage,
+            epoch_offset=epoch_offset,
         )
         fit_seconds = time.perf_counter() - fit_t0
 
         ckpt_t0 = time.perf_counter()
-        best_epoch = model.load_best_checkpoint()
+        restore_info = model.load_best_checkpoint()
         checkpoint_seconds = time.perf_counter() - ckpt_t0
 
         summary = training_timer.record_stage_summary(
@@ -101,10 +102,21 @@ class TrainingStageRunner:
         global_epoch = epoch_offset + epochs_completed
         if experiment is not None:
             CometTracker.log_stage_timing(experiment, stage, summary, step=global_epoch)
+            if restore_info is not None:
+                CometTracker.log_checkpoint_restore(
+                    experiment,
+                    stage=stage,
+                    global_epoch=int(restore_info["global_epoch"]),
+                )
 
         print(
             f"  Etapa {stage}: {summary['stage_wall_seconds']:.1f}s total "
             f"(setup={setup_seconds:.1f}s, warmup={warmup_seconds:.1f}s, "
             f"fit={fit_seconds:.1f}s, checkpoint={checkpoint_seconds:.1f}s)"
         )
-        return history, best_epoch, summary
+        if restore_info is not None:
+            print(
+                f"  Restore etapa {stage}: epoca global {restore_info['global_epoch']} "
+                f"(epoca {restore_info['epoch']} de la etapa)"
+            )
+        return history, restore_info, summary

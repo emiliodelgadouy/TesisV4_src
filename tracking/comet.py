@@ -105,6 +105,27 @@ def log_stage_timing(experiment, stage: int, summary: dict[str, float], *, step:
     )
 
 
+def log_checkpoint_restore(
+    experiment,
+    *,
+    stage: int,
+    global_epoch: int,
+    final: bool = False,
+) -> None:
+    """Loguea la epoca global a la que se restauran pesos (eje de Comet, no la epoca local del stage)."""
+    global_epoch = int(global_epoch)
+    stage = int(stage)
+    metrics = {f"stage_{stage}_restore_epoch": global_epoch}
+    if final:
+        metrics["restore_epoch"] = global_epoch
+        metrics["restore_stage"] = stage
+        experiment.log_parameter("restore_epoch", global_epoch)
+        experiment.log_parameter("restore_stage", stage)
+        experiment.log_other("restore_epoch", global_epoch)
+        experiment.log_other("restore_stage", stage)
+    experiment.log_metrics(metrics, step=global_epoch, epoch=global_epoch)
+
+
 def log_training_timing_summary(experiment, training_timer) -> None:
     """Loguea tiempos totales y por etapa al finalizar el entrenamiento."""
     total_seconds = training_timer.elapsed_since_training_start()
@@ -671,6 +692,8 @@ def log_test_results(
     y_train_pred_default=None,
     y_train_pred_youden=None,
     final_weights_path=None,
+    restore_epoch=None,
+    restore_stage=None,
     show_plots: bool = True,
 ) -> str:
     """Loguea evaluacion completa a Comet de forma simetrica para train/val/test.
@@ -725,13 +748,16 @@ def log_test_results(
         )
 
     # Escalares globales (umbrales elegidos en validacion + mejor metrica de val).
-    experiment.log_metrics(
-        {
-            "val_best_auc": round(float(best_val_metric), 4),
-            "thr_youden": round(float(thr_youden), 4),
-            "thr_recall90": round(float(thr_recall90), 4),
-        }
-    )
+    final_metrics = {
+        "val_best_auc": round(float(best_val_metric), 4),
+        "thr_youden": round(float(thr_youden), 4),
+        "thr_recall90": round(float(thr_recall90), 4),
+    }
+    if restore_epoch is not None:
+        final_metrics["restore_epoch"] = int(restore_epoch)
+    if restore_stage is not None:
+        final_metrics["restore_stage"] = int(restore_stage)
+    experiment.log_metrics(final_metrics)
 
     if final_weights_path is not None:
         _log_final_weights(
@@ -777,6 +803,18 @@ class CometTracker:
     @staticmethod
     def log_stage_timing(experiment, stage: int, summary: dict[str, float], *, step: int) -> None:
         log_stage_timing(experiment, stage, summary, step=step)
+
+    @staticmethod
+    def log_checkpoint_restore(experiment, *, stage: int, global_epoch: int, final: bool = False) -> None:
+        log_checkpoint_restore(experiment, stage=stage, global_epoch=global_epoch, final=final)
+
+    def log_global_checkpoint_restore(self, checkpoint: dict) -> None:
+        log_checkpoint_restore(
+            self.experiment,
+            stage=int(checkpoint["stage"]),
+            global_epoch=int(checkpoint["global_epoch"]),
+            final=True,
+        )
 
     def log_training_timing_summary(self, training_timer) -> None:
         log_training_timing_summary(self.experiment, training_timer)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Callable, ClassVar
+import inspect
+from abc import ABC, abstractmethod
+from typing import Callable, ClassVar, override
 
 from tensorflow import keras
 
@@ -50,12 +52,10 @@ def mode_batch_sizes(
     }
 
 
-class Backbone:
+class Backbone(ABC):
     key: ClassVar[str]
     input_size: ClassVar[InputSize]
     default_weights: ClassVar[str | None] = None
-    application: ClassVar[ModelFactory]
-    preprocess_fn: ClassVar[PreprocessFunction]
     batch_size: ClassVar[dict[str, int]] = dict(_DEFAULT_BATCH_SIZE)
     # "spatial": activaciones ~ H×W (CNN, Swin). "attention": ~ (H×W)^2 (ViT FULL).
     batch_memory_scale: ClassVar[str] = "spatial"
@@ -64,8 +64,11 @@ class Backbone:
 
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
-        if "key" in cls.__dict__:
-            _REGISTRY[cls.key] = cls()
+        if "key" not in cls.__dict__:
+            return
+        if inspect.isabstract(cls):
+            raise TypeError(f"{cls.__name__} declara key={cls.key!r} pero debe implementar preprocess_input y build")
+        _REGISTRY[cls.key] = cls()
 
     def batch_size_for(self, mode: str) -> int | None:
         """Batch calibrado para ``mode``, o None si el provider no lo declara."""
@@ -76,16 +79,13 @@ class Backbone:
                 return int(value)
         return None
 
+    @abstractmethod
     def preprocess_input(self, x):
-        return self.__class__.preprocess_fn(x)
+        """Normalizacion de la imagen de entrada del backbone."""
 
+    @abstractmethod
     def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
-        return self.__class__.application(
-            weights=self.coalesce_weights(weights),
-            include_top=include_top,
-            input_shape=self.input_shape_or_default(input_shape),
-            **kwargs,
-        )
+        """Modelo Keras sin cabeza de clasificacion (extractor espacial)."""
 
     def resolve(self, input_size: InputSize | None = None) -> tuple[keras.Model, PreprocessFunction, InputSize]:
         size = input_size or self.input_size
@@ -102,6 +102,21 @@ class Backbone:
 
 class ImagenetBackbone(Backbone):
     default_weights = "imagenet"
+    application: ClassVar[ModelFactory]
+    preprocess_fn: ClassVar[PreprocessFunction]
+
+    @override
+    def preprocess_input(self, x):
+        return type(self).preprocess_fn(x)
+
+    @override
+    def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
+        return type(self).application(
+            weights=self.coalesce_weights(weights),
+            include_top=include_top,
+            input_shape=self.input_shape_or_default(input_shape),
+            **kwargs,
+        )
 
 
 def get_backbone(name: str) -> Backbone:
@@ -109,9 +124,7 @@ def get_backbone(name: str) -> Backbone:
         return _REGISTRY[name]
     except KeyError as exc:
         available = ", ".join(sorted(_REGISTRY))
-        raise ValueError(
-            f"Backbone {name!r} no disponible. Opciones: {available}"
-        ) from exc
+        raise ValueError(f"Backbone {name!r} no disponible. Opciones: {available}") from exc
 
 
 def resolve_backbone(name: str, input_size: InputSize | None = None) -> tuple[keras.Model, PreprocessFunction, InputSize]:

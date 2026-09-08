@@ -285,6 +285,12 @@ class TrainingExperiment:
             )
             tracker.log_training_timing_summary(training_timer)
             best_global_checkpoint = model.load_best_global_checkpoint()
+            tracker.log_global_checkpoint_restore(best_global_checkpoint)
+            print(
+                f"  Restore global: stage {best_global_checkpoint['stage']}, "
+                f"epoca global {best_global_checkpoint['global_epoch']} "
+                f"(epoca {best_global_checkpoint['epoch']} de la etapa)"
+            )
 
             tracker.log_keras_eval_metrics(
                 model,
@@ -357,6 +363,8 @@ class TrainingExperiment:
                 thr_recall90=thr_recall90,
                 best_val_metric=best_global_checkpoint["value"],
                 final_weights_path=best_global_checkpoint["path"],
+                restore_epoch=best_global_checkpoint["global_epoch"],
+                restore_stage=best_global_checkpoint["stage"],
                 show_plots=False,
             )
             experiment = None  # ya cerrado por log_test_results; evita doble end() en finally
@@ -371,6 +379,8 @@ class TrainingExperiment:
                     "input_size": list(input_size),
                     "val_best_metric_name": str(best_global_checkpoint["monitor"]),
                     "val_best_metric": float(best_global_checkpoint["value"]),
+                    "restore_epoch": int(best_global_checkpoint["global_epoch"]),
+                    "restore_stage": int(best_global_checkpoint["stage"]),
                     "final_weights_file": str(best_global_checkpoint["path"]),
                     "test_roc_auc": float(roc_auc_score(y_test_true, y_test_prob)),
                     "test_pr_auc": float(average_precision_score(y_test_true, y_test_prob)),

@@ -1,3 +1,5 @@
+from typing import override
+
 from tensorflow import keras
 
 from src.model_builder.base import BaseModelBuilder
@@ -11,12 +13,16 @@ class SimpleModelBuilder(BaseModelBuilder):
     #   +-------------+    +--------------+    +------------+    +----------+    +-----+    +------------+    +---------+    +-----------------+
     model_name = "simple"
 
-    def build(self):
-        inputs = self.inputs()
-        x = self.augmentation(inputs)
+    @override
+    def inputs(self):
+        return keras.Input(shape=(self.IMG_SIZE[0], self.IMG_SIZE[1], 3), name="image")
+
+    @override
+    def encode_features(self, x):
+        x = self.augmentation(x)
         x = self.preprocess(x)
-        x = self.backbone(x)
-        x = self.head(x)
-        outputs = self.output(x)
-        self.model = keras.Model(inputs, outputs, name=self.model_name)
-        return self.compile()
+        return self.backbone(x)
+
+    @override
+    def aggregate(self, x):
+        return self.head(x)

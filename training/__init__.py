@@ -6,6 +6,7 @@ __all__ = [
     "EpochTimer",
     "GpuResources",
     "MemoryEpochLogger",
+    "ModelTrainer",
     "Predictor",
     "RandomSeeds",
     "ThresholdSelector",
@@ -28,6 +29,7 @@ _LAZY = {
     "ThresholdSelector": ("src.training.evaluator", "ThresholdSelector"),
     "TrainingExperiment": ("src.training.experiment", "TrainingExperiment"),
     "TrainingStageRunner": ("src.training.stage_runner", "TrainingStageRunner"),
+    "ModelTrainer": ("src.training.model_trainer", "ModelTrainer"),
 }
 
 

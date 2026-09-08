@@ -1,28 +1,22 @@
-from pathlib import Path
-import math
-import re
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
 
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 
-from src.dataset.provider import as_tf_dataset
-from src.training.timer import EpochTimer, MemoryEpochLogger
+from src.training.model_trainer import ModelTrainer
 
 
-def _sanitize_checkpoint_prefix(name: str) -> str:
-    slug = re.sub(r"[^\w.\-]+", "_", str(name).strip())
-    return slug.strip("_") or "run"
+class BaseModelBuilder(ABC):
+    """Arma el grafo Keras. El loop de fit/checkpoint vive en ``ModelTrainer``.
 
+    Template method ``build``: ``inputs`` -> ``encode_features`` -> ``aggregate``
+    -> ``regularize`` -> ``output``. Las subclases concretas tienen que
+    implementar los tres pasos marcados abstractos.
+    """
 
-def _is_finite_number(value) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
-class BaseModelBuilder:
     model_name = "model"
 
     def __init__(self, IMG_SIZE, backbone, preprocess_input, backbone_trainable=False, top_dense=256, dropout=0.4, learning_rate=1e-3, focal_alpha=0.90, focal_gamma=2.0, metric_to_maximize="pr_auc", checkpoint_monitor=None, monitor_mode="max", early_stopping_patience=8, reduce_lr_patience=4, reduce_lr_factor=0.5, min_lr=1e-7, aggressive_augmentation=False, initial_bias=None, pretrained_builder=None, jit_compile=True, steps_per_execution=32, checkpoint_prefix=None, lateralized_inputs=False):
@@ -54,20 +48,56 @@ class BaseModelBuilder:
         self.reduce_lr_patience = reduce_lr_patience
         self.reduce_lr_factor = reduce_lr_factor
         self.min_lr = min_lr
-        self.checkpoint_dir = Path("checkpoints")
-        self.checkpoint_path = self.checkpoint_dir / "best_checkpoint.weights.h5"
-        self.fit_number = 0
-        self.best_checkpoints = []
-        self._global_checkpoint_loaded = False
         self.initial_bias = initial_bias
         self.jit_compile = jit_compile
         self.steps_per_execution = steps_per_execution
-        self.checkpoint_prefix = (
-            _sanitize_checkpoint_prefix(checkpoint_prefix) if checkpoint_prefix else None
-        )
         self.lateralized_inputs = lateralized_inputs
         self.loss_from_logits = True
         self.model = None
+        self.trainer = ModelTrainer(self, checkpoint_prefix=checkpoint_prefix)
+
+    @property
+    def checkpoint_prefix(self):
+        return self.trainer.checkpoint_prefix
+
+    @property
+    def best_checkpoints(self):
+        return self.trainer.best_checkpoints
+
+    @property
+    def _global_checkpoint_loaded(self) -> bool:
+        return self.trainer.global_checkpoint_loaded
+
+    @abstractmethod
+    def inputs(self):
+        """Tensor de entrada del grafo (imagen, bag o canvas)."""
+
+    @abstractmethod
+    def encode_features(self, x):
+        """Representacion previa al agregado (mapa espacial o instancias)."""
+
+    @abstractmethod
+    def aggregate(self, x):
+        """Reduce el encode a un vector de bag/imagen."""
+
+    def regularize(self, x):
+        return x
+
+    def keras_model_name(self) -> str:
+        return self.model_name
+
+    def after_build(self):
+        """Hook post-grafo (p.ej. transferir pesos) antes de ``compile``."""
+        return None
+
+    def build(self):
+        inputs = self.inputs()
+        x = self.encode_features(inputs)
+        x = self.aggregate(x)
+        x = self.regularize(x)
+        self.model = keras.Model(inputs, self.output(x), name=self.keras_model_name())
+        self.after_build()
+        return self.compile()
 
     def top_mlp(self, x):
         # capas densas de la cabeza (relu + dropout)
@@ -84,25 +114,26 @@ class BaseModelBuilder:
         if not self.lateralized_inputs:
             layers_list.append(layers.RandomFlip("horizontal", name="aug_flip_h"))
         if self.aggressive_augmentation:
-            layers_list.extend([
-                layers.RandomRotation(0.14, fill_mode="reflect", name="aug_rot"),
-                layers.RandomZoom(height_factor=(0.0, 0.22), width_factor=(0.0, 0.22), fill_mode="reflect", name="aug_zoom"),
-                layers.RandomTranslation(height_factor=0.14, width_factor=0.14, fill_mode="reflect", name="aug_translate"),
-                layers.RandomContrast(0.25, name="aug_contrast"),
-                layers.RandomBrightness(0.25, value_range=(0.0, 255.0), name="aug_brightness"),
-            ])
+            layers_list.extend(
+                [
+                    layers.RandomRotation(0.14, fill_mode="reflect", name="aug_rot"),
+                    layers.RandomZoom(height_factor=(0.0, 0.22), width_factor=(0.0, 0.22), fill_mode="reflect", name="aug_zoom"),
+                    layers.RandomTranslation(height_factor=0.14, width_factor=0.14, fill_mode="reflect", name="aug_translate"),
+                    layers.RandomContrast(0.25, name="aug_contrast"),
+                    layers.RandomBrightness(0.25, value_range=(0.0, 255.0), name="aug_brightness"),
+                ]
+            )
             return keras.Sequential(layers_list, name="augmentation_aggressive")
-        layers_list.extend([
-            layers.RandomContrast(0.08),
-            layers.RandomBrightness(0.08, value_range=(0.0, 255.0)),
-        ])
+        layers_list.extend(
+            [
+                layers.RandomContrast(0.08),
+                layers.RandomBrightness(0.08, value_range=(0.0, 255.0)),
+            ]
+        )
         return keras.Sequential(layers_list, name="augmentation")
 
     def augmentation(self, x):
         return self.augmentation_seq()(x)
-
-    def inputs(self):
-        return keras.Input(shape=(self.IMG_SIZE[0], self.IMG_SIZE[1], 3), name="image")
 
     def output(self, x):
         # salida binaria en logits (sigmoid va en la loss)
@@ -171,126 +202,25 @@ class BaseModelBuilder:
         return self.compile()
 
     def compile(self):
-        self.model.compile(
-            optimizer=self.optimizer(),
-            loss=self.focal_loss(),
-            metrics=self.metrics(),
-            jit_compile=self.jit_compile,
-            steps_per_execution=self.steps_per_execution,
-        )
-        return self
-
-    def build(self):
-        raise NotImplementedError
+        return self.trainer.compile()
 
     def summary(self):
         return self.model.summary()
 
-    def checkpoint_filepath(self, epoch):
-        # path del checkpoint por epoca
-        path = Path(self.checkpoint_path)
-        stem = path.name.removesuffix(".weights.h5")
-        return path.with_name(f"{stem}_epoch{epoch:02d}.weights.h5")
-
-    def checkpoint_files(self):
-        path = Path(self.checkpoint_path)
-        stem = path.name.removesuffix(".weights.h5")
-        return path.parent.glob(f"{stem}_epoch*.weights.h5")
-
-    def monitor_improved(self, current, best):
-        # NaN/Inf nunca mejoran; un best no finito se reemplaza por el primer valor finito.
-        if not _is_finite_number(current):
-            return False
-        if best is None or not _is_finite_number(best):
-            return True
-        return current < best if self.monitor_mode == "min" else current > best
-
-    def checkpoint_callback(self):
-        # guarda pesos cuando mejora la metrica monitoreada
-        monitor = self.checkpoint_monitor
-        stage = self.fit_number
-        best_value = {monitor: None}
-
-        def on_epoch_end(epoch, logs):
-            logs = logs or {}
-            if monitor not in logs:
-                print(f"\nEpoch {epoch + 1}: {monitor} ausente en logs; se omite checkpoint")
-                return
-            current = float(logs[monitor])
-            if not self.monitor_improved(current, best_value[monitor]):
-                return
-            checkpoint_path = self.checkpoint_filepath(epoch + 1)
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            self.model.save_weights(str(checkpoint_path))
-            for old_path in self.checkpoint_files():
-                if old_path != checkpoint_path:
-                    old_path.unlink()
-            best_value[monitor] = current
-            self.best_checkpoints = [info for info in self.best_checkpoints if info["stage"] != stage]
-            self.best_checkpoints.append({"stage": stage, "epoch": epoch + 1, "monitor": monitor, "value": current, "path": checkpoint_path})
-            print(f"\nEpoch {epoch + 1}: {monitor} improved to {current:.4f}. Saved {checkpoint_path}")
-
-        return keras.callbacks.LambdaCallback(on_epoch_end=on_epoch_end)
-
-    def early_stopping_callback(self):
-        return keras.callbacks.EarlyStopping(monitor=self.checkpoint_monitor, mode=self.monitor_mode, patience=self.early_stopping_patience, restore_best_weights=True, verbose=1)
-
-    def reduce_lr_callback(self):
-        return keras.callbacks.ReduceLROnPlateau(monitor=self.checkpoint_monitor, mode=self.monitor_mode, factor=self.reduce_lr_factor, patience=self.reduce_lr_patience, min_lr=self.min_lr, verbose=1)
-
     def callbacks(self, training_timer=None):
-        return [
-            self.checkpoint_callback(),
-            self.early_stopping_callback(),
-            self.reduce_lr_callback(),
-            EpochTimer(training_timer=training_timer),
-            MemoryEpochLogger(),
-        ]
+        return self.trainer.callbacks(training_timer=training_timer)
 
     def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None):
-        # entrena una etapa (frozen / partial / full) y trackea checkpoints por stage.
-        # ``stage`` explicito alinea nombres on-disk con Comet aunque se omitan etapas.
-        if stage is not None:
-            self.fit_number = int(stage)
-        else:
-            self.fit_number += 1
-        stage_stem = (
-            f"{self.checkpoint_prefix}_stage_{self.fit_number}"
-            if self.checkpoint_prefix
-            else f"stage_{self.fit_number}"
-        )
-        self.checkpoint_path = self.checkpoint_dir / f"{stage_stem}.weights.h5"
-        return self.model.fit(as_tf_dataset(train_ds), validation_data=as_tf_dataset(val_ds), epochs=epochs, callbacks=self.callbacks(training_timer=training_timer) + list(callbacks or []))
+        return self.trainer.fit(train_ds, val_ds, epochs=epochs, callbacks=callbacks, training_timer=training_timer, stage=stage)
 
     def load_best_checkpoint(self):
-        # carga el mejor checkpoint de la etapa actual; si no hay, conserva pesos en memoria.
-        info = next((item for item in self.best_checkpoints if item["stage"] == self.fit_number), None)
-        if info is None:
-            print(
-                f"Advertencia: no hay checkpoint para stage {self.fit_number}; "
-                "se mantienen los pesos actuales del modelo"
-            )
-            return None
-        self.model.load_weights(str(info["path"]))
-        return info["epoch"]
+        return self.trainer.load_best_checkpoint()
 
     def load_best_global_checkpoint(self):
-        # carga el mejor checkpoint de toda la corrida (entre stages)
-        if not self.best_checkpoints:
-            raise RuntimeError(
-                "No hay checkpoints guardados para cargar "
-                f"(model_name={self.model_name!r}, prefix={self.checkpoint_prefix!r})"
-            )
-        finite = [item for item in self.best_checkpoints if _is_finite_number(item.get("value"))]
-        pool = finite or self.best_checkpoints
-        pick = min if self.monitor_mode == "min" else max
-        info = pick(pool, key=lambda i: i["value"])
-        self.model.load_weights(str(info["path"]))
-        self._global_checkpoint_loaded = True
-        return info
+        return self.trainer.load_best_global_checkpoint()
 
     def evaluate(self, test_ds, return_dict=True):
-        return self.model.evaluate(as_tf_dataset(test_ds), return_dict=return_dict)
+        return self.trainer.evaluate(test_ds, return_dict=return_dict)
 
     def predict(self, test_ds, verbose=1):
-        return self.model.predict(as_tf_dataset(test_ds), verbose=verbose)
+        return self.trainer.predict(test_ds, verbose=verbose)

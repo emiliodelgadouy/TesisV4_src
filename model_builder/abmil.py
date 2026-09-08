@@ -1,3 +1,5 @@
+from typing import override
+
 from src.model_builder.layers import GatedAttentionPooling
 from src.model_builder.mil_base import MilModelBuilderBase
 
@@ -16,14 +18,17 @@ class AbmilModelBuilder(MilModelBuilderBase):
     #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
     model_name = "abmil"
 
+    @override
     def pool_instances(self, x):
         # atencion gated sobre instancias (Ilse et al.)
         return GatedAttentionPooling(attention_dim=self.attention_dim, gated=self.attention_gated, name="attention_pooling")(x)
 
-    def build_keras_tiling(self):
+    @override
+    def keras_model_name(self) -> str:
         # Conserva la identidad del submodo (p.ej. abmil_patch_hardneg).
-        self.model_name = f"{type(self).model_name}_keras_tiling"
-        return super().build_keras_tiling()
+        if self.bag_keras_tiling:
+            return f"{type(self).model_name}_keras_tiling"
+        return self.model_name
 
 
 class AbmilPatchHardnegModelBuilder(AbmilModelBuilder):
@@ -41,7 +46,8 @@ class AbmilPatchHardnegModelBuilder(AbmilModelBuilder):
     #   +---------------------+    +--------------+    +------------+    +-----------+    +-------------+    +--------+    +---------------+    +------------+    +------------+    +-------------+    +-----------------+
     model_name = "abmil_patch_hardneg"
 
-    def build(self):
-        if self.pretrained_builder is None:
+    @override
+    def __init__(self, *args, pretrained_builder=None, **kwargs):
+        if pretrained_builder is None:
             raise ValueError("abmil_patch_hardneg requiere pretrained_builder entrenado en patch_hardneg")
-        return super().build()
+        super().__init__(*args, pretrained_builder=pretrained_builder, **kwargs)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import override
 
 import gdown
 from tensorflow import keras
@@ -26,9 +27,11 @@ class CheXNetBackbone(Backbone):
     default_weights = "chexnet"
     batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
 
+    @override
     def preprocess_input(self, x):
         return densenet_preprocess(x)
 
+    @override
     def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
         if self.coalesce_weights(weights) != "chexnet":
             raise ValueError("CheXNet solo admite weights='chexnet'")

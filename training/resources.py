@@ -37,6 +37,10 @@ class GpuResources:
         """Rompe referencias internas de un builder para que gc libere tras clear_session."""
         if builder_obj is None:
             return
+        trainer = getattr(builder_obj, "trainer", None)
+        if trainer is not None:
+            trainer.builder = None
+            builder_obj.trainer = None
         builder_obj.model = None
         builder_obj.backbone = None
         builder_obj.pretrained_builder = None

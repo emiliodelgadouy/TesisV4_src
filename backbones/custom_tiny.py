@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import override
+
 from tensorflow import keras
 from tensorflow.keras import layers
 
@@ -12,10 +14,12 @@ class CustomTinyBackbone(Backbone):
     default_weights = None
     batch_size = mode_batch_sizes(simple=512, full=256, abmil=128)
 
+    @override
     def preprocess_input(self, x):
         # identidad, el rescale va en el modelo
         return x
 
+    @override
     def build(self, *, weights=DEFAULT_WEIGHTS, include_top: bool = False, input_shape: tuple[int, int, int] | None = None, **kwargs) -> keras.Model:
         # cnn minima (2 convs) para medir overhead del pipeline, sin transfer learning
         inputs = keras.Input(shape=self.input_shape_or_default(input_shape), name="input")

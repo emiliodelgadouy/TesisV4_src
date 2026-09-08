@@ -6,7 +6,6 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 # GPU: deben quedar fijadas antes del primer import de TensorFlow.
 os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 os.environ.setdefault("TF_CUDNN_USE_AUTOTUNE", "1")
 
 from pathlib import Path
@@ -119,7 +118,6 @@ class NotebookRuntime:
     ) -> None:
         running_in_colab = cls.is_running_in_colab()
         os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
-        os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
         os.environ.setdefault("TF_CUDNN_USE_AUTOTUNE", "1")
         os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"
         os.environ["TF_GPU_THREAD_COUNT"] = "2"
