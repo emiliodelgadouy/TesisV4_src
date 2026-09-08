@@ -40,6 +40,7 @@ class ModelTrainer:
         self.checkpoint_path = self.checkpoint_dir / "best_checkpoint.weights.h5"
         self.checkpoint_prefix = _sanitize_checkpoint_prefix(checkpoint_prefix) if checkpoint_prefix else None
         self.fit_number = 0
+        self.epoch_offset = 0
         self.best_checkpoints: list[dict] = []
         self.global_checkpoint_loaded = False
 
@@ -93,7 +94,17 @@ class ModelTrainer:
                     old_path.unlink()
             best_value[monitor] = current
             self.best_checkpoints = [info for info in self.best_checkpoints if info["stage"] != stage]
-            self.best_checkpoints.append({"stage": stage, "epoch": epoch + 1, "monitor": monitor, "value": current, "path": checkpoint_path})
+            local_epoch = epoch + 1
+            self.best_checkpoints.append(
+                {
+                    "stage": stage,
+                    "epoch": local_epoch,
+                    "global_epoch": self.epoch_offset + local_epoch,
+                    "monitor": monitor,
+                    "value": current,
+                    "path": checkpoint_path,
+                }
+            )
             print(f"\nEpoch {epoch + 1}: {monitor} improved to {current:.4f}. Saved {checkpoint_path}")
 
         return keras.callbacks.LambdaCallback(on_epoch_end=on_epoch_end)
@@ -115,12 +126,14 @@ class ModelTrainer:
             MemoryEpochLogger(),
         ]
 
-    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None):
+    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None, epoch_offset=0):
         # ``stage`` explicito alinea nombres on-disk con Comet aunque se omitan etapas.
+        # ``epoch_offset`` no cambia el conteo local de Keras; solo indexa Comet y ``global_epoch``.
         if stage is not None:
             self.fit_number = int(stage)
         else:
             self.fit_number += 1
+        self.epoch_offset = int(epoch_offset)
         stage_stem = f"{self.checkpoint_prefix}_stage_{self.fit_number}" if self.checkpoint_prefix else f"stage_{self.fit_number}"
         self.checkpoint_path = self.checkpoint_dir / f"{stage_stem}.weights.h5"
         from src.dataset.provider import as_tf_dataset
@@ -133,7 +146,7 @@ class ModelTrainer:
             print(f"Advertencia: no hay checkpoint para stage {self.fit_number}; se mantienen los pesos actuales del modelo")
             return None
         self.builder.model.load_weights(str(info["path"]))
-        return info["epoch"]
+        return info
 
     def load_best_global_checkpoint(self):
         builder = self.builder
