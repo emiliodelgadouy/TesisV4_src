@@ -1,6 +1,6 @@
 """Paquete de entrenamiento: modos, etapas, evaluacion y recursos GPU."""
 
-from src.training.mode import TrainingMode
+from src.training.mode import TrainingMode, resolve_abmil_config
 
 __all__ = [
     "EpochTimer",
@@ -11,6 +11,7 @@ __all__ = [
     "ThresholdSelector",
     "TrainingExperiment",
     "TrainingMode",
+    "resolve_abmil_config",
     "TrainingStageRunner",
     "TrainingTimer",
 ]

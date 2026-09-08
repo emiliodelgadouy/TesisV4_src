@@ -12,7 +12,7 @@ from src.dataset.splits import SplitManager
 from src.model_builder import ModelBuilder
 from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
-from src.training.mode import TrainingMode
+from src.training.mode import TrainingMode, resolve_abmil_config
 from src.training.resources import GpuResources
 from src.training.stage_runner import TrainingStageRunner
 from src.training.timer import TrainingTimer, sample_memory_usage
@@ -59,31 +59,31 @@ class TrainingExperiment:
 
         general = config["GENERAL"]
         training = config["TRAINING"]
-        mil = config["MIL"]
+        abmil_cfg = resolve_abmil_config(config)
         full_cfg = config.get("FULL") or {}
         patch_cfg = config.get("PATCH") or {}
         patch_hardneg_cfg = config.get("PATCH_HARDNEG") or {}
 
-        bag_grid = full_cfg.get("BAG_GRID", (3, 3))
-        bag_canvas_mode = full_cfg.get("BAG_CANVAS_MODE", "resize")
-        bag_keras_tiling = mil["BAG_KERAS_TILING"]
-        attention_dim = mil["ATTENTION_DIM"]
-        attention_gated = mil["ATTENTION_GATED"]
+        bag_grid = abmil_cfg["BAG_GRID"]
+        bag_canvas_mode = abmil_cfg["BAG_CANVAS_MODE"]
+        bag_keras_tiling = abmil_cfg["BAG_KERAS_TILING"]
+        attention_dim = abmil_cfg["ATTENTION_DIM"]
+        attention_gated = abmil_cfg["ATTENTION_GATED"]
         patch_resize_to_bag_canvas = patch_cfg.get("RESIZE_TO_BAG_CANVAS", True)
         patch_align_to_bag_grid = (
             patch_hardneg_cfg.get("ALIGN_TO_BAG_GRID", False)
             if mode == "patch_hardneg"
             else False
         )
-        # FULL = misma escala que el canvas ABMIL: BAG_GRID * tamaño nativo del backbone.
-        # FULL["INPUT_SIZE"] queda como override opcional (p.ej. pruebas puntuales).
+        # FULL usa su propio INPUT_SIZE. Si falta, 3× el nativo del backbone
+        # (default historico, ya no lee la grilla de ABMIL).
         if mode == "full":
             full_override = full_cfg.get("INPUT_SIZE")
             if full_override is not None:
                 input_size = tuple(full_override)
             else:
                 native_h, native_w = get_backbone(backbone_name).input_size
-                input_size = (bag_grid[0] * native_h, bag_grid[1] * native_w)
+                input_size = (3 * native_h, 3 * native_w)
         else:
             input_size = None
 
@@ -96,7 +96,11 @@ class TrainingExperiment:
         if self.experiment_suffix:
             exp_name = f"{exp_name}_{self.experiment_suffix}"
         is_mil_run = TrainingMode.is_mil(mode)
-        batch_size = mil["BATCH_SIZE"] if is_mil_run else general["BATCH_SIZE"]
+        batch_size = (
+            abmil_cfg.get("BATCH_SIZE", general["BATCH_SIZE"])
+            if is_mil_run
+            else general["BATCH_SIZE"]
+        )
         # Default: cache on en simple/patch; off en full/abmil (canvases grandes).
         cache_dataset = general.get("CACHE_DATASET", not is_mil_run and mode != "full")
 

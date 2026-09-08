@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 TRAINING_MODES = (
     "simple",
     "abmil",
@@ -82,3 +84,25 @@ class TrainingMode:
     @classmethod
     def is_patch(cls, name: str) -> bool:
         return cls.parse(name) in PATCH_MODES
+
+
+def resolve_abmil_config(config: Mapping) -> dict:
+    """Config de ABMIL: ``CONFIG["ABMIL"]``.
+
+    Acepta el alias legado ``MIL`` y ``FULL["BAG_GRID" / "BAG_CANVAS_MODE"]``.
+    Si hay ``ABMIL``, pisa las claves del legado.
+    """
+    merged: dict = {}
+    merged.update(config.get("MIL") or {})
+    full = config.get("FULL") or {}
+    if "BAG_GRID" in full:
+        merged.setdefault("BAG_GRID", full["BAG_GRID"])
+    if "BAG_CANVAS_MODE" in full:
+        merged.setdefault("BAG_CANVAS_MODE", full["BAG_CANVAS_MODE"])
+    merged.update(config.get("ABMIL") or {})
+    merged.setdefault("BAG_GRID", (3, 3))
+    merged.setdefault("BAG_CANVAS_MODE", "resize")
+    merged.setdefault("BAG_KERAS_TILING", True)
+    merged.setdefault("ATTENTION_DIM", 128)
+    merged.setdefault("ATTENTION_GATED", True)
+    return merged

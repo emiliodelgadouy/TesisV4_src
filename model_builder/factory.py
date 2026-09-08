@@ -2,7 +2,7 @@ from src.model_builder.abmil import AbmilModelBuilder, AbmilPatchHardnegModelBui
 from src.model_builder.full import FullModelBuilder
 from src.model_builder.patch import PatchHardnegModelBuilder, PatchModelBuilder
 from src.model_builder.simple import SimpleModelBuilder
-from src.training.mode import TrainingMode
+from src.training.mode import TrainingMode, resolve_abmil_config
 
 _BUILDERS = {
     "simple": SimpleModelBuilder,
@@ -45,7 +45,7 @@ class ModelBuilderFactory:
         # de cada corrida (backbone, mode, initial_bias, ...) sigue llegando por argumento.
         general = config["GENERAL"]
         training = config["TRAINING"]
-        mil_config = config["MIL"]
+        abmil_cfg = resolve_abmil_config(config)
         metric_to_maximize = general["METRIC_TO_MAXIMIZE"]
         monitor_mode = "min" if metric_to_maximize == "loss" else "max"
 
@@ -76,14 +76,13 @@ class ModelBuilderFactory:
             lateralized_inputs=lateralized_inputs,
         )
         if TrainingMode.is_mil(mode):
-            full_cfg = config.get("FULL") or {}
             return _BUILDERS[mode](
                 **common,
                 bag_size=bag_size,
-                attention_dim=mil_config["ATTENTION_DIM"],
-                attention_gated=mil_config["ATTENTION_GATED"],
-                bag_grid=full_cfg.get("BAG_GRID", (3, 3)),
-                bag_keras_tiling=mil_config["BAG_KERAS_TILING"],
+                attention_dim=abmil_cfg["ATTENTION_DIM"],
+                attention_gated=abmil_cfg["ATTENTION_GATED"],
+                bag_grid=abmil_cfg["BAG_GRID"],
+                bag_keras_tiling=abmil_cfg["BAG_KERAS_TILING"],
             )
         return _BUILDERS[mode](**common)
 

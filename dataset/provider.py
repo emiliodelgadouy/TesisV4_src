@@ -9,7 +9,7 @@ import tensorflow as tf
 
 from src.dataset.images import ImageDecoder
 from src.dataset.mixup import PositiveMixup
-from src.training.mode import TrainingMode
+from src.training.mode import TrainingMode, resolve_abmil_config
 
 SplitName = Literal["train", "val", "test"]
 PatchSampling = Literal["uniform", "normal"]
@@ -1291,15 +1291,14 @@ def build_dataset_provider(
             )
         if config is not None:
             general = config["GENERAL"]
-            mil = config["MIL"]
-            full_cfg = config.get("FULL") or {}
+            abmil_cfg = resolve_abmil_config(config)
             patch_cfg = config.get("PATCH") or {}
             defaults = {
                 "seed": general["RANDOM_SEED"],
                 "use_clahe": general["USE_CLAHE"],
-                "bag_grid": full_cfg.get("BAG_GRID", (3, 3)),
-                "bag_keras_tiling": mil["BAG_KERAS_TILING"],
-                "bag_canvas_mode": full_cfg.get("BAG_CANVAS_MODE", "resize"),
+                "bag_grid": abmil_cfg["BAG_GRID"],
+                "bag_keras_tiling": abmil_cfg["BAG_KERAS_TILING"],
+                "bag_canvas_mode": abmil_cfg["BAG_CANVAS_MODE"],
                 "patch_resize_to_bag_canvas": patch_cfg.get("RESIZE_TO_BAG_CANVAS", True),
             }
             # Los kwargs explicitos pisan los defaults del CONFIG.
