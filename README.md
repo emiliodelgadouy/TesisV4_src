@@ -15,10 +15,13 @@ src/
 
 Modos de entrenamiento:
 
-- `simple`, `full`, `patch`, `patch_hardneg`
+- `standard`, `resized`, `patch`, `patch_hardneg`
 - `abmil`
 - `abmil_patch_hardneg`: transfiere backbone y proyección densa desde `patch_hardneg`;
   usa una salida de bag nueva
+
+`standard` usa el tamaño nativo del backbone. `resized` recorre la lista discreta
+`CONFIG["RESIZED"]["INPUT_SIZES"]`.
 
 Para la transferencia patch → ABMIL, entrenar `patch_hardneg` con
 `PATCH_HARDNEG.ALIGN_TO_BAG_GRID=True`.

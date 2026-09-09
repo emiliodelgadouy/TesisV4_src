@@ -10,7 +10,7 @@ class VGG16Backbone(ImagenetBackbone):
     application = VGG16
     preprocess_fn = vgg16_preprocess
     input_size = (224, 224)
-    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)
+    batch_size = mode_batch_sizes(standard=128, resized=64, abmil=32)
 
 
 class VGG19Backbone(ImagenetBackbone):
@@ -18,4 +18,4 @@ class VGG19Backbone(ImagenetBackbone):
     application = VGG19
     preprocess_fn = vgg19_preprocess
     input_size = (224, 224)
-    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)
+    batch_size = mode_batch_sizes(standard=128, resized=64, abmil=32)

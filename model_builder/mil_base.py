@@ -13,6 +13,8 @@ from src.model_builder.layers import BagTiling
 class MilModelBuilderBase(BaseModelBuilder, ABC):
     """Grafo MIL: encode por instancia, ``pool_instances`` obligatorio en la subclase."""
 
+    cache_by_default = False
+
     @override
     def __init__(self, *args, bag_size=None, attention_dim=128, attention_gated=True, bag_grid=(3, 3), bag_keras_tiling=False, **kwargs):
         super().__init__(*args, **kwargs)

@@ -5,13 +5,15 @@ from tensorflow import keras
 from src.model_builder.base import BaseModelBuilder
 
 
-class SimpleModelBuilder(BaseModelBuilder):
-    # Clasificador de imagen completa:
+class ImageClassifierBuilder(BaseModelBuilder):
+    # Grafo compartido: imagen -> aug -> preprocess -> backbone -> GAP -> MLP -> logits.
+    # Standard y Resized heredan esto y pisan la politica de tamaño; patch usa esta clase
+    # y deja el crop en el dataset.
     #
     #   +-------------+    +--------------+    +------------+    +----------+    +-----+    +------------+    +---------+    +-----------------+
     #   | image HxWx3 |--->| augmentation |--->| preprocess |--->| backbone |--->| GAP |--->| Dense+ReLU |--->| Dropout |--->| Dense(1) logits |
     #   +-------------+    +--------------+    +------------+    +----------+    +-----+    +------------+    +---------+    +-----------------+
-    model_name = "simple"
+    model_name = "image"
 
     @override
     def inputs(self):

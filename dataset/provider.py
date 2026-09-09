@@ -315,7 +315,7 @@ class TfDatasetConfig:
     positive_mixup_alpha: float = 0.1
     positive_mixup_probability: float = 0.5
     # Modo MIL (ABMIL): cada imagen es un "bag" troceado en parches.
-    mode: str = "simple"
+    mode: str = "standard"
     bag_grid: tuple[int, int] = (3, 3)
     bag_keras_tiling: bool = False
     bag_canvas_mode: BagCanvasMode = "resize"
@@ -379,7 +379,7 @@ class DatasetProviderConfig:
     positive_mixup: bool = False
     positive_mixup_alpha: float = 0.1
     positive_mixup_probability: float = 0.5
-    mode: str = "simple"
+    mode: str = "standard"
     bag_grid: tuple[int, int] = (3, 3)
     bag_keras_tiling: bool = False
     bag_canvas_mode: BagCanvasMode = "resize"

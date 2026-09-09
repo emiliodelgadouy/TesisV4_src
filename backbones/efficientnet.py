@@ -18,7 +18,7 @@ class EfficientNetB0Backbone(ImagenetBackbone):
     application = EfficientNetB0
     preprocess_fn = preprocess_input
     input_size = (224, 224)
-    batch_size = mode_batch_sizes(simple=256, full=128, abmil=64)
+    batch_size = mode_batch_sizes(standard=256, resized=128, abmil=64)
 
 
 class EfficientNetB1Backbone(ImagenetBackbone):
@@ -26,7 +26,7 @@ class EfficientNetB1Backbone(ImagenetBackbone):
     application = EfficientNetB1
     preprocess_fn = preprocess_input
     input_size = (240, 240)
-    batch_size = mode_batch_sizes(simple=256, full=128, abmil=64)
+    batch_size = mode_batch_sizes(standard=256, resized=128, abmil=64)
 
 
 class EfficientNetB2Backbone(ImagenetBackbone):
@@ -34,7 +34,7 @@ class EfficientNetB2Backbone(ImagenetBackbone):
     application = EfficientNetB2
     preprocess_fn = preprocess_input
     input_size = (260, 260)
-    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
+    batch_size = mode_batch_sizes(standard=256, resized=64, abmil=64)
 
 
 class EfficientNetB3Backbone(ImagenetBackbone):
@@ -42,7 +42,7 @@ class EfficientNetB3Backbone(ImagenetBackbone):
     application = EfficientNetB3
     preprocess_fn = preprocess_input
     input_size = (300, 300)
-    batch_size = mode_batch_sizes(simple=128, full=64, abmil=32)
+    batch_size = mode_batch_sizes(standard=128, resized=64, abmil=32)
 
 
 class EfficientNetB4Backbone(ImagenetBackbone):
@@ -50,7 +50,7 @@ class EfficientNetB4Backbone(ImagenetBackbone):
     application = EfficientNetB4
     preprocess_fn = preprocess_input
     input_size = (380, 380)
-    batch_size = mode_batch_sizes(simple=128, full=32, abmil=32)
+    batch_size = mode_batch_sizes(standard=128, resized=32, abmil=32)
 
 
 class EfficientNetB5Backbone(ImagenetBackbone):
@@ -58,7 +58,7 @@ class EfficientNetB5Backbone(ImagenetBackbone):
     application = EfficientNetB5
     preprocess_fn = preprocess_input
     input_size = (456, 456)
-    batch_size = mode_batch_sizes(simple=64, full=32, abmil=16)
+    batch_size = mode_batch_sizes(standard=64, resized=32, abmil=16)
 
 
 class EfficientNetB6Backbone(ImagenetBackbone):
@@ -66,7 +66,7 @@ class EfficientNetB6Backbone(ImagenetBackbone):
     application = EfficientNetB6
     preprocess_fn = preprocess_input
     input_size = (528, 528)
-    batch_size = mode_batch_sizes(simple=64, full=16, abmil=16)
+    batch_size = mode_batch_sizes(standard=64, resized=16, abmil=16)
 
 
 class EfficientNetB7Backbone(ImagenetBackbone):
@@ -74,4 +74,4 @@ class EfficientNetB7Backbone(ImagenetBackbone):
     application = EfficientNetB7
     preprocess_fn = preprocess_input
     input_size = (600, 600)
-    batch_size = mode_batch_sizes(simple=32, full=16, abmil=8)
+    batch_size = mode_batch_sizes(standard=32, resized=16, abmil=8)

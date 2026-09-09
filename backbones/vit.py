@@ -176,9 +176,9 @@ class ViTS16Backbone(Backbone):
     input_size = (224, 224)
     default_weights = "imagenet"
     preprocess_fn = staticmethod(vit_preprocess_input)
-    # FULL a 672: atencion cuadratica (~1764 tokens). ABMIL tiles a 224.
+    # RESIZED a 672: atencion cuadratica (~1764 tokens). ABMIL tiles a 224.
     batch_memory_scale = "attention"
-    batch_size = mode_batch_sizes(simple=128, full=8, abmil=32)
+    batch_size = mode_batch_sizes(standard=128, resized=8, abmil=32)
 
     @override
     def preprocess_input(self, x):

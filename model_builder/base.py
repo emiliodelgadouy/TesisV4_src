@@ -18,8 +18,9 @@ class BaseModelBuilder(ABC):
     """
 
     model_name = "model"
+    cache_by_default = True
 
-    def __init__(self, IMG_SIZE, backbone, preprocess_input, backbone_trainable=False, top_dense=256, dropout=0.4, learning_rate=1e-3, focal_alpha=0.90, focal_gamma=2.0, metric_to_maximize="pr_auc", checkpoint_monitor=None, monitor_mode="max", early_stopping_patience=8, reduce_lr_patience=4, reduce_lr_factor=0.5, min_lr=1e-7, aggressive_augmentation=False, initial_bias=None, pretrained_builder=None, jit_compile=True, steps_per_execution=32, checkpoint_prefix=None, lateralized_inputs=False):
+    def __init__(self, IMG_SIZE, backbone, preprocess_input, backbone_trainable=False, top_dense=256, dropout=0.4, learning_rate=1e-3, focal_alpha=0.90, focal_gamma=2.0, metric_to_maximize="pr_auc", checkpoint_monitor=None, monitor_mode="max", early_stopping_patience=8, reduce_lr_patience=4, reduce_lr_factor=0.5, min_lr=1e-7, aggressive_augmentation=False, initial_bias=None, pretrained_builder=None, jit_compile=True, steps_per_execution=32, checkpoint_prefix=None, lateralized_inputs=False, model_name=None):
         self.pretrained_builder = pretrained_builder
         if pretrained_builder is not None:
             # Evita recargar si el caller (p.ej. experiment) ya cargo el mejor global.
@@ -54,6 +55,8 @@ class BaseModelBuilder(ABC):
         self.lateralized_inputs = lateralized_inputs
         self.loss_from_logits = True
         self.model = None
+        if model_name is not None:
+            self.model_name = str(model_name)
         self.trainer = ModelTrainer(self, checkpoint_prefix=checkpoint_prefix)
 
     @property
@@ -85,6 +88,29 @@ class BaseModelBuilder(ABC):
 
     def keras_model_name(self) -> str:
         return self.model_name
+
+    @classmethod
+    def resolve_input_size(cls, config, *, native_size, requested=None, mode_name_raw=None):
+        """Tamaño del tensor de entrada. Default: nativo del backbone."""
+        del config, mode_name_raw
+        if requested is not None:
+            label = mode_name_raw if mode_name_raw is not None else cls.model_name
+            raise ValueError(f"input_size solo aplica al modo resized, no a {label!r}")
+        height, width = native_size
+        return (int(height), int(width))
+
+    @classmethod
+    def experiment_name(cls, backbone_name, *, mode, input_size, suffix=None) -> str:
+        del input_size
+        name = f"{mode}_{backbone_name}"
+        if suffix:
+            return f"{name}_{suffix}"
+        return name
+
+    @classmethod
+    def extra_run_config(cls, config, *, native_size, input_size) -> dict:
+        del config, native_size, input_size
+        return {}
 
     def after_build(self):
         """Hook post-grafo (p.ej. transferir pesos) antes de ``compile``."""

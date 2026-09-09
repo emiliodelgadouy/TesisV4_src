@@ -16,11 +16,11 @@ BACKBONES = _REGISTRY
 
 # A100 80GB + mixed_float16, etapa 3 (backbone entero). Los valores son el
 # maximo que entra sin OOM / sin dejar el GPU idle en la geometria de
-# referencia: SIMPLE/PATCH a S nativo, FULL a 672, ABMIL a grilla 3×3.
-# ``resolve_batch_size`` escala si FULL o BAG_GRID cambian.
+# referencia: STANDARD/PATCH a S nativo, RESIZED a 672, ABMIL a grilla 3×3.
+# ``resolve_batch_size`` escala si RESIZED o BAG_GRID cambian.
 _DEFAULT_BATCH_SIZE = {
-    "simple": 256,
-    "full": 128,
+    "standard": 256,
+    "resized": 128,
     "patch": 256,
     "patch_hardneg": 256,
     "abmil": 64,
@@ -30,21 +30,21 @@ _DEFAULT_BATCH_SIZE = {
 
 def mode_batch_sizes(
     *,
-    simple: int,
-    full: int,
+    standard: int,
+    resized: int,
     abmil: int,
     patch: int | None = None,
     patch_hardneg: int | None = None,
     abmil_patch_hardneg: int | None = None,
 ) -> dict[str, int]:
-    """Batch de referencia por modo (A100 80GB; SIMPLE a S, FULL a 672, ABMIL 3×3).
+    """Batch de referencia por modo (A100 80GB; STANDARD a S, RESIZED a 672, ABMIL 3×3).
 
-    PATCH sigue a SIMPLE y ABMIL_PATCH_HARDNEG a ABMIL si no se pasan.
+    PATCH sigue a STANDARD y ABMIL_PATCH_HARDNEG a ABMIL si no se pasan.
     """
-    patch_bs = simple if patch is None else patch
+    patch_bs = standard if patch is None else patch
     return {
-        "simple": int(simple),
-        "full": int(full),
+        "standard": int(standard),
+        "resized": int(resized),
         "patch": int(patch_bs),
         "patch_hardneg": int(patch_bs if patch_hardneg is None else patch_hardneg),
         "abmil": int(abmil),
@@ -57,7 +57,7 @@ class Backbone(ABC):
     input_size: ClassVar[InputSize]
     default_weights: ClassVar[str | None] = None
     batch_size: ClassVar[dict[str, int]] = dict(_DEFAULT_BATCH_SIZE)
-    # "spatial": activaciones ~ H×W (CNN, Swin). "attention": ~ (H×W)^2 (ViT FULL).
+    # "spatial": activaciones ~ H×W (CNN, Swin). "attention": ~ (H×W)^2 (ViT RESIZED).
     batch_memory_scale: ClassVar[str] = "spatial"
     # False: no fusionar steps en un while de tf.function (capas custom + CUDA).
     supports_fused_train_steps: ClassVar[bool] = True

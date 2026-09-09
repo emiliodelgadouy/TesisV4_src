@@ -23,6 +23,7 @@ from src.dataset.splits import SplitManager
 from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
 from src.training.experiment import TrainingExperiment
+from src.training.mode import resolve_resized_input_sizes
 from src.training.resources import RandomSeeds
 
 def login_comet(config) -> None:
@@ -66,6 +67,7 @@ def run_training_experiment(
     return_summary=False,
     experiment_suffix=None,
     dispose_pretrained_builder=True,
+    input_size=None,
 ):
     return TrainingExperiment(
         config,
@@ -79,7 +81,18 @@ def run_training_experiment(
         return_summary=return_summary,
         experiment_suffix=experiment_suffix,
         dispose_pretrained_builder=dispose_pretrained_builder,
+        input_size=input_size,
     ).run()
+
+
+def resized_input_sizes(config, backbone_name=None):
+    """Lista discreta de canvases RESIZED (enteros o pares del CONFIG)."""
+    native_size = None
+    if backbone_name is not None:
+        from src.backbones import get_backbone
+
+        native_size = get_backbone(backbone_name).input_size
+    return resolve_resized_input_sizes(config, native_size=native_size)
 
 
 __all__ = [
@@ -92,6 +105,7 @@ __all__ = [
     "login_comet",
     "predict_probs_and_labels",
     "prepare_dataset",
+    "resized_input_sizes",
     "run_training_experiment",
     "set_random_seeds",
     "threshold_youden_j",

@@ -9,7 +9,7 @@ import numpy as np
 from src.backbones import get_backbone, resolve_backbone
 from src.dataset.provider import build_dataset_provider
 from src.dataset.splits import SplitManager
-from src.model_builder import ModelBuilder
+from src.model_builder import ModelBuilder, ModelBuilderFactory
 from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
 from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size
@@ -35,8 +35,10 @@ class TrainingExperiment:
         return_summary=False,
         experiment_suffix=None,
         dispose_pretrained_builder=True,
+        input_size=None,
     ) -> None:
         self.config = config
+        self.mode_name_raw = mode
         self.mode = TrainingMode.parse(mode)
         self.backbone_name = backbone_name
         self.train_df = train_df
@@ -47,6 +49,7 @@ class TrainingExperiment:
         self.return_summary = return_summary
         self.experiment_suffix = experiment_suffix
         self.dispose_pretrained_builder = dispose_pretrained_builder
+        self.requested_input_size = input_size
 
     def run(self):
         config = self.config
@@ -60,7 +63,6 @@ class TrainingExperiment:
         general = config["GENERAL"]
         training = config["TRAINING"]
         abmil_cfg = resolve_abmil_config(config)
-        full_cfg = config.get("FULL") or {}
         patch_cfg = config.get("PATCH") or {}
         patch_hardneg_cfg = config.get("PATCH_HARDNEG") or {}
 
@@ -75,27 +77,28 @@ class TrainingExperiment:
             if mode == "patch_hardneg"
             else False
         )
-        # FULL usa su propio INPUT_SIZE. Si falta, 3× el nativo del backbone
-        # (default historico, ya no lee la grilla de ABMIL).
+        # STANDARD usa el tamaño nativo del backbone. RESIZED elige un canvas
+        # de la lista discreta CONFIG["RESIZED"]["INPUT_SIZES"].
         native_size = get_backbone(backbone_name).input_size
-        if mode == "full":
-            full_override = full_cfg.get("INPUT_SIZE")
-            if full_override is not None:
-                input_size = tuple(full_override)
-            else:
-                native_h, native_w = native_size
-                input_size = (3 * native_h, 3 * native_w)
-        else:
-            input_size = native_size
+        builder_cls = ModelBuilderFactory.class_for(mode)
+        input_size = builder_cls.resolve_input_size(
+            config,
+            native_size=native_size,
+            requested=self.requested_input_size,
+            mode_name_raw=self.mode_name_raw,
+        )
 
         experiment = model = builder = backbone = dataset_provider = train_ds = val_ds = (
             ds_test
         ) = result_builder = summary = pretrain_best = None
         GpuResources.release(clear_keras_session=pretrained_builder is None)
 
-        exp_name = f"{mode}_{backbone_name}"
-        if self.experiment_suffix:
-            exp_name = f"{exp_name}_{self.experiment_suffix}"
+        exp_name = builder_cls.experiment_name(
+            backbone_name,
+            mode=mode,
+            input_size=input_size,
+            suffix=self.experiment_suffix,
+        )
         is_mil_run = TrainingMode.is_mil(mode)
         batch_size, batch_size_source, batch_size_base = resolve_batch_size(
             config,
@@ -107,8 +110,11 @@ class TrainingExperiment:
         print(
             f"batch_size={batch_size} (source={batch_size_source}, base={batch_size_base})"
         )
-        # Default: cache on en simple/patch; off en full/abmil (canvases grandes).
-        cache_dataset = general.get("CACHE_DATASET", not is_mil_run and mode != "full")
+        # GENERAL.CACHE_DATASET es el interruptor; el builder pone el techo.
+        # RESIZED/ABMIL tienen cache_by_default=False: no cachear canvases grandes en RAM.
+        wanted_cache = general.get("CACHE_DATASET", builder_cls.cache_by_default)
+        cache_dataset = bool(wanted_cache) and builder_cls.cache_by_default
+        print(f"cache_dataset={cache_dataset}")
 
         if mode in ("patch", "patch_hardneg"):
             patch_ratio = (
@@ -175,6 +181,9 @@ class TrainingExperiment:
                 "FOCAL_ALPHA_EFFECTIVE": focal_alpha,
                 "INITIAL_BIAS_EFFECTIVE": bias,
             }
+            run_config.update(
+                builder_cls.extra_run_config(config, native_size=native_size, input_size=input_size)
+            )
             if mode in ("patch", "patch_hardneg"):
                 run_config["PATCH_ALIGN_TO_BAG_GRID"] = patch_align_to_bag_grid
                 run_config["PATCH_RESIZE_TO_BAG_CANVAS"] = patch_resize_to_bag_canvas
@@ -201,6 +210,7 @@ class TrainingExperiment:
                 )
                 run_config["PRETRAINED_FROM"] = f"{pretraining_mode}_{backbone_name}"
                 run_config["PRETRAINED_BEST_VAL_METRIC"] = pretrain_best["value"]
+                run_config["PRETRAINED_BEST_VAL_METRIC_NAME"] = pretrain_best["monitor"]
                 run_config["PRETRAINED_FROZEN_STAGE1"] = ["backbone", "dense"]
                 run_config["BAG_OUTPUT_INITIALIZATION"] = "new"
 
@@ -227,6 +237,9 @@ class TrainingExperiment:
                 steps_per_execution=steps_per_execution,
             )
             model = builder.build()
+            run_config["CHECKPOINT_MONITOR"] = builder.checkpoint_monitor
+            run_config["MONITOR_MODE"] = builder.monitor_mode
+            run_config["METRIC_TO_MAXIMIZE"] = builder.metric_to_maximize
 
             tracker = CometTracker.start(
                 config, experiment_name=exp_name, run_config=run_config, model=model.model
@@ -362,6 +375,7 @@ class TrainingExperiment:
                 thr_youden=thr_youden,
                 thr_recall90=thr_recall90,
                 best_val_metric=best_global_checkpoint["value"],
+                best_val_metric_name=best_global_checkpoint["monitor"],
                 final_weights_path=best_global_checkpoint["path"],
                 restore_epoch=best_global_checkpoint["global_epoch"],
                 restore_stage=best_global_checkpoint["stage"],
@@ -396,10 +410,9 @@ class TrainingExperiment:
                     for key, value in stage_summary.items():
                         summary[f"stage_{stage}_{key}"] = float(value)
                 monitor_name = str(best_global_checkpoint["monitor"])
-                if monitor_name == "val_auc":
-                    summary["val_best_auc"] = float(best_global_checkpoint["value"])
-                elif monitor_name == "val_pr_auc":
-                    summary["val_best_pr_auc"] = float(best_global_checkpoint["value"])
+                summary[f"val_best_{monitor_name.removeprefix('val_')}"] = float(
+                    best_global_checkpoint["value"]
+                )
                 if prediction_paths:
                     summary["train_predictions_file"] = str(prediction_paths["train"])
                     summary["val_predictions_file"] = str(prediction_paths["val"])
@@ -408,6 +421,7 @@ class TrainingExperiment:
                 if pretrain_best is not None:
                     summary["pretrained_checkpoint"] = str(pretrain_best["path"])
                     summary["pretrained_best_metric"] = float(pretrain_best["value"])
+                    summary["pretrained_best_metric_name"] = str(pretrain_best["monitor"])
 
             if self.return_builder:
                 model.pretraining_mode = mode

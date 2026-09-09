@@ -25,7 +25,7 @@ class CheXNetBackbone(Backbone):
     key = "chexnet"
     input_size = (224, 224)
     default_weights = "chexnet"
-    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
+    batch_size = mode_batch_sizes(standard=256, resized=64, abmil=64)
 
     @override
     def preprocess_input(self, x):

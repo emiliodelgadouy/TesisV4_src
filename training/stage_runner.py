@@ -74,7 +74,12 @@ class TrainingStageRunner:
         if experiment is not None:
             callbacks.insert(
                 0,
-                CometEpochLogger(experiment, epoch_offset=epoch_offset, stage=stage),
+                CometEpochLogger(
+                    experiment,
+                    epoch_offset=epoch_offset,
+                    stage=stage,
+                    monitor=getattr(model, "checkpoint_monitor", None),
+                ),
             )
         history = model.fit(
             train_ds,

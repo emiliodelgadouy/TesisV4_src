@@ -12,7 +12,7 @@ class CustomTinyBackbone(Backbone):
     key = "customtiny"
     input_size = (64, 64)
     default_weights = None
-    batch_size = mode_batch_sizes(simple=512, full=256, abmil=128)
+    batch_size = mode_batch_sizes(standard=512, resized=256, abmil=128)
 
     @override
     def preprocess_input(self, x):

@@ -1,21 +1,30 @@
-from src.model_builder.abmil import AbmilModelBuilder, AbmilPatchHardnegModelBuilder
-from src.model_builder.full import FullModelBuilder
-from src.model_builder.patch import PatchHardnegModelBuilder, PatchModelBuilder
-from src.model_builder.simple import SimpleModelBuilder
+from src.model_builder.abmil import AbmilModelBuilder
+from src.model_builder.image import ImageClassifierBuilder
+from src.model_builder.resized import ResizedModelBuilder
+from src.model_builder.standard import StandardModelBuilder
 from src.training.mode import TrainingMode, resolve_abmil_config
 
 _BUILDERS = {
-    "simple": SimpleModelBuilder,
-    "full": FullModelBuilder,
+    "standard": StandardModelBuilder,
+    "resized": ResizedModelBuilder,
+    "patch": ImageClassifierBuilder,
+    "patch_hardneg": ImageClassifierBuilder,
     "abmil": AbmilModelBuilder,
-    "abmil_patch_hardneg": AbmilPatchHardnegModelBuilder,
-    "patch": PatchModelBuilder,
-    "patch_hardneg": PatchHardnegModelBuilder,
+    "abmil_patch_hardneg": AbmilModelBuilder,
 }
 
 
 class ModelBuilderFactory:
-    """Despacha el builder de Keras segun el modo canonico."""
+    """Despacha el builder de Keras segun el modo canonico.
+
+    standard y resized son clases distintas: nativo vs canvas discreto.
+    patch / patch_hardneg reusan el grafo de imagen; el crop lo hace el dataset.
+    abmil / abmil_patch_hardneg reusan ABMIL; el segundo exige encoder patch.
+    """
+
+    @staticmethod
+    def class_for(mode) -> type:
+        return _BUILDERS[TrainingMode.parse(mode)]
 
     @staticmethod
     def create(
@@ -24,7 +33,7 @@ class ModelBuilderFactory:
         backbone,
         preprocess_input,
         *,
-        mode="simple",
+        mode="standard",
         initial_bias=None,
         focal_alpha=0.90,
         bag_size=None,
@@ -50,6 +59,7 @@ class ModelBuilderFactory:
         monitor_mode = "min" if metric_to_maximize == "loss" else "max"
 
         mode = TrainingMode.parse(mode)
+        builder_cls = ModelBuilderFactory.class_for(mode)
         common = dict(
             IMG_SIZE=IMG_SIZE,
             backbone=backbone,
@@ -74,9 +84,12 @@ class ModelBuilderFactory:
             steps_per_execution=steps_per_execution,
             checkpoint_prefix=checkpoint_prefix,
             lateralized_inputs=lateralized_inputs,
+            model_name=mode,
         )
         if TrainingMode.is_mil(mode):
-            return _BUILDERS[mode](
+            if mode == TrainingMode.ABMIL_PATCH_HARDNEG and pretrained_builder is None:
+                raise ValueError("abmil_patch_hardneg requiere pretrained_builder entrenado en patch_hardneg")
+            return builder_cls(
                 **common,
                 bag_size=bag_size,
                 attention_dim=abmil_cfg["ATTENTION_DIM"],
@@ -84,7 +97,7 @@ class ModelBuilderFactory:
                 bag_grid=abmil_cfg["BAG_GRID"],
                 bag_keras_tiling=abmil_cfg["BAG_KERAS_TILING"],
             )
-        return _BUILDERS[mode](**common)
+        return builder_cls(**common)
 
 
 def create_model_builder(*args, **kwargs):

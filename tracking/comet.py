@@ -35,12 +35,30 @@ def _experiment_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _log_run_label(experiment, key: str, value) -> None:
+    """Texto comparable en Hyperparameters y Other (Comet no acepta strings como metricas)."""
+    experiment.log_parameter(key, value)
+    experiment.log_other(key, value)
+
+
 def _log_run_timestamp(experiment, key: str, value: str | None = None) -> str:
     """Deja la marca de tiempo en Other y Hyperparameters (columna comparable entre runs)."""
     stamp = value or _experiment_timestamp()
-    experiment.log_parameter(key, stamp)
-    experiment.log_other(key, stamp)
+    _log_run_label(experiment, key, stamp)
     return stamp
+
+
+def _normalize_monitor_name(monitor: str | None) -> str:
+    """Keras/checkpoint usan ``val_<metric>``; METRIC_TO_MAXIMIZE a veces viene sin el prefijo."""
+    name = str(monitor or "auc").strip() or "auc"
+    if not name.startswith("val_"):
+        name = f"val_{name}"
+    return name
+
+
+def _val_best_metric_key(monitor: str | None) -> str:
+    """Nombre Comet del mejor valor del monitor, p.ej. ``val_pr_auc`` -> ``val_best_pr_auc``."""
+    return f"val_best_{_normalize_monitor_name(monitor).removeprefix('val_')}"
 
 
 def login_comet(config) -> None:
@@ -71,11 +89,19 @@ def _prefixed_epoch_metrics(logs: dict[str, float]) -> dict[str, float]:
 class CometEpochLogger(keras.callbacks.Callback):
     """Loguea metricas de Keras en Comet indexadas por epoch global (no por batch step)."""
 
-    def __init__(self, experiment, *, epoch_offset: int = 0, stage: int | None = None):
+    def __init__(
+        self,
+        experiment,
+        *,
+        epoch_offset: int = 0,
+        stage: int | None = None,
+        monitor: str | None = None,
+    ):
         super().__init__()
         self.experiment = experiment
         self.epoch_offset = epoch_offset
         self.stage = stage
+        self.monitor = _normalize_monitor_name(monitor) if monitor else None
 
     def on_train_begin(self, logs=None):
         # Alinear step/epoch internos de Comet con el contador global de epocas.
@@ -86,6 +112,12 @@ class CometEpochLogger(keras.callbacks.Callback):
         logs = logs or {}
         metrics = _prefixed_epoch_metrics(logs)
         global_epoch = self.epoch_offset + epoch + 1
+        if self.monitor is not None:
+            raw = logs.get(self.monitor)
+            if raw is None:
+                raw = logs.get(self.monitor.removeprefix("val_"))
+            if raw is not None:
+                metrics["val_monitored"] = float(raw)
         if self.stage is not None:
             self.experiment.log_metric(
                 "training_stage",
@@ -111,6 +143,8 @@ def log_checkpoint_restore(
     stage: int,
     global_epoch: int,
     final: bool = False,
+    monitor: str | None = None,
+    value=None,
 ) -> None:
     """Loguea la epoca global a la que se restauran pesos (eje de Comet, no la epoca local del stage)."""
     global_epoch = int(global_epoch)
@@ -119,10 +153,15 @@ def log_checkpoint_restore(
     if final:
         metrics["restore_epoch"] = global_epoch
         metrics["restore_stage"] = stage
-        experiment.log_parameter("restore_epoch", global_epoch)
-        experiment.log_parameter("restore_stage", stage)
-        experiment.log_other("restore_epoch", global_epoch)
-        experiment.log_other("restore_stage", stage)
+        _log_run_label(experiment, "restore_epoch", global_epoch)
+        _log_run_label(experiment, "restore_stage", stage)
+        if value is not None:
+            best_value = float(value)
+            metrics["val_best_metric"] = best_value
+            if monitor:
+                monitor_name = _normalize_monitor_name(monitor)
+                metrics[_val_best_metric_key(monitor_name)] = best_value
+                _log_run_label(experiment, "val_best_metric_name", monitor_name)
     experiment.log_metrics(metrics, step=global_epoch, epoch=global_epoch)
 
 
@@ -158,6 +197,16 @@ def start_training_experiment(
     experiment.set_epoch(0)
     experiment.log_parameters(run_config)
     _log_run_timestamp(experiment, "run_started_at")
+    metric_to_maximize = run_config.get("METRIC_TO_MAXIMIZE")
+    checkpoint_monitor = run_config.get("CHECKPOINT_MONITOR")
+    if metric_to_maximize:
+        _log_run_label(experiment, "METRIC_TO_MAXIMIZE", metric_to_maximize)
+        experiment.add_tag(f"maximize:{metric_to_maximize}")
+    if checkpoint_monitor:
+        _log_run_label(experiment, "CHECKPOINT_MONITOR", checkpoint_monitor)
+    monitor_mode = run_config.get("MONITOR_MODE")
+    if monitor_mode:
+        _log_run_label(experiment, "MONITOR_MODE", monitor_mode)
     if model is not None:
         experiment.set_model_graph(model)
         _log_model_param_counts(experiment, model)
@@ -683,6 +732,7 @@ def log_test_results(
     thr_youden: float,
     thr_recall90: float,
     best_val_metric: float,
+    best_val_metric_name: str | None = None,
     y_val_true=None,
     y_val_prob=None,
     y_val_pred_default=None,
@@ -703,7 +753,9 @@ def log_test_results(
     el nombre del split ({split}_roc_auc, {split}_pr_auc, {split}_sens_youden,
     {split}_spec_youden, {split}_sens_recall90, {split}_spec_recall90, {split}_n,
     {split}_pos). Train y val son opcionales: solo se loguean si se pasan sus
-    predicciones/probabilidades.
+    predicciones/probabilidades. El mejor valor del monitor de checkpoint se
+    loguea como ``val_best_metric`` y ``val_best_<metric>`` (p.ej. ``val_best_pr_auc``);
+    el nombre queda en ``val_best_metric_name`` / ``METRIC_TO_MAXIMIZE``.
     """
     prob_threshold = config["GENERAL"]["PROBABILITY_THRESHOLD"]
     splits = [
@@ -747,9 +799,18 @@ def log_test_results(
             show_plots=show_plots,
         )
 
-    # Escalares globales (umbrales elegidos en validacion + mejor metrica de val).
+    # Escalares globales (umbrales de val + mejor valor del monitor de checkpoint).
+    general = config.get("GENERAL") or {}
+    monitor = _normalize_monitor_name(
+        best_val_metric_name or general.get("METRIC_TO_MAXIMIZE")
+    )
+    best_value = round(float(best_val_metric), 4)
+    best_key = _val_best_metric_key(monitor)
+    _log_run_label(experiment, "val_best_metric_name", monitor)
+    _log_run_label(experiment, "METRIC_TO_MAXIMIZE", monitor.removeprefix("val_"))
     final_metrics = {
-        "val_best_auc": round(float(best_val_metric), 4),
+        "val_best_metric": best_value,
+        best_key: best_value,
         "thr_youden": round(float(thr_youden), 4),
         "thr_recall90": round(float(thr_recall90), 4),
     }
@@ -805,8 +866,23 @@ class CometTracker:
         log_stage_timing(experiment, stage, summary, step=step)
 
     @staticmethod
-    def log_checkpoint_restore(experiment, *, stage: int, global_epoch: int, final: bool = False) -> None:
-        log_checkpoint_restore(experiment, stage=stage, global_epoch=global_epoch, final=final)
+    def log_checkpoint_restore(
+        experiment,
+        *,
+        stage: int,
+        global_epoch: int,
+        final: bool = False,
+        monitor: str | None = None,
+        value=None,
+    ) -> None:
+        log_checkpoint_restore(
+            experiment,
+            stage=stage,
+            global_epoch=global_epoch,
+            final=final,
+            monitor=monitor,
+            value=value,
+        )
 
     def log_global_checkpoint_restore(self, checkpoint: dict) -> None:
         log_checkpoint_restore(
@@ -814,6 +890,8 @@ class CometTracker:
             stage=int(checkpoint["stage"]),
             global_epoch=int(checkpoint["global_epoch"]),
             final=True,
+            monitor=checkpoint.get("monitor"),
+            value=checkpoint.get("value"),
         )
 
     def log_training_timing_summary(self, training_timer) -> None:

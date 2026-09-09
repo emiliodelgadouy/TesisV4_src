@@ -365,7 +365,7 @@ class SwinTBackbone(Backbone):
     input_size = (224, 224)
     default_weights = "imagenet"
     preprocess_fn = staticmethod(swin_preprocess_input)
-    batch_size = mode_batch_sizes(simple=256, full=64, abmil=64)
+    batch_size = mode_batch_sizes(standard=256, resized=64, abmil=64)
     supports_fused_train_steps = False
 
     @override

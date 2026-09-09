@@ -1,6 +1,6 @@
 """Paquete de entrenamiento: modos, etapas, evaluacion y recursos GPU."""
 
-from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, scale_batch_size
+from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, scale_batch_size, resolve_resized_input_sizes, resolve_resized_input_size, resolve_resized_batch_size, resized_size_label
 
 __all__ = [
     "EpochTimer",
@@ -14,6 +14,10 @@ __all__ = [
     "TrainingMode",
     "resolve_abmil_config",
     "resolve_batch_size",
+    "resolve_resized_batch_size",
+    "resolve_resized_input_size",
+    "resolve_resized_input_sizes",
+    "resized_size_label",
     "scale_batch_size",
     "TrainingStageRunner",
     "TrainingTimer",
