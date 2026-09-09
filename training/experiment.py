@@ -12,7 +12,7 @@ from src.dataset.splits import SplitManager
 from src.model_builder import ModelBuilder, ModelBuilderFactory
 from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
-from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size
+from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
 from src.training.resources import GpuResources
 from src.training.stage_runner import TrainingStageRunner
 from src.training.timer import TrainingTimer, sample_memory_usage
@@ -110,10 +110,12 @@ class TrainingExperiment:
         print(
             f"batch_size={batch_size} (source={batch_size_source}, base={batch_size_base})"
         )
-        # GENERAL.CACHE_DATASET es el interruptor; el builder pone el techo.
-        # RESIZED/ABMIL tienen cache_by_default=False: no cachear canvases grandes en RAM.
-        wanted_cache = general.get("CACHE_DATASET", builder_cls.cache_by_default)
-        cache_dataset = bool(wanted_cache) and builder_cls.cache_by_default
+        wanted_cache = bool(general.get("CACHE_DATASET", builder_cls.cache_by_default))
+        if mode == TrainingMode.RESIZED:
+            per_size = resolve_resized_cache(self.config, input_size)
+            cache_dataset = wanted_cache and (builder_cls.cache_by_default if per_size is None else per_size)
+        else:
+            cache_dataset = wanted_cache and builder_cls.cache_by_default
         print(f"cache_dataset={cache_dataset}")
 
         if mode in ("patch", "patch_hardneg"):

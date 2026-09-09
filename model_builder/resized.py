@@ -4,6 +4,7 @@ from src.model_builder.image import ImageClassifierBuilder
 from src.training.mode import (
     TrainingMode,
     resolve_resized_batch_size,
+    resolve_resized_cache,
     resolve_resized_input_size,
     resolve_resized_input_sizes,
     resized_size_label,
@@ -49,6 +50,11 @@ class ResizedModelBuilder(ImageClassifierBuilder):
                 resized_size_label(size): resolve_resized_batch_size(config, size) for size in sizes
             }
             extra["RESIZED_BATCH_SIZE"] = resolve_resized_batch_size(config, input_size)
+        if dict(config.get("RESIZED") or {}).get("CACHE") is not None:
+            extra["RESIZED_CACHE"] = {
+                resized_size_label(size): resolve_resized_cache(config, size) for size in sizes
+            }
+            extra["RESIZED_CACHE_EFFECTIVE"] = resolve_resized_cache(config, input_size)
         return extra
 
     @override

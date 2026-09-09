@@ -48,10 +48,10 @@ class DatasetRepository:
         En Colab ``gsutil`` falla si usa las credenciales de la VM: esa identidad
         no tiene IAM en el bucket, aunque el objeto sea público. Se fuerza un
         entorno anónimo (HOME / CLOUDSDK_CONFIG aislados). El tar es un objeto
-        compuesto: sin la extensión C de crcmod, gsutil aborta el CRC32C; se
-        usa ``check_hashes=if_fast_else_skip`` y se verifica el Content-Length
-        por HTTPS. ``gcloud storage`` no acepta flags de slicing (son
-        properties). Si ninguno corre, sigue curl en paralelo por HTTPS.
+        compuesto: sin crcmod compilado gsutil no puede rebanar y copia en un
+        solo stream (el ``.partial`` queda en 0 B hasta el final). Solo se usa
+        gsutil si ``gsutil version -l`` reporta crcmod compilado; si no, curl
+        paralelo por HTTPS. ``gcloud storage`` queda como fallback.
         """
         destination_file.parent.mkdir(parents=True, exist_ok=True)
         url = self._gcs_uri_to_https(source)
@@ -62,8 +62,8 @@ class DatasetRepository:
 
         ok = (
             self._download_with_gsutil(source, partial)
-            or self._download_with_gcloud_storage(source, partial)
             or self._download_with_curl_parallel(url, partial)
+            or self._download_with_gcloud_storage(source, partial)
             or self._download_with_curl(url, partial)
         )
         if not ok:
@@ -121,13 +121,35 @@ class DatasetRepository:
         env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
         env["BOTO_CONFIG"] = str(boto)
         env["BOTO_PATH"] = str(boto)
-        # Evita que el metadata de GCE/Colab inyecte la SA de la VM.
-        env["GCE_METADATA_HOST"] = "metadata.invalid"
-        env["GCE_METADATA_ROOT"] = "metadata.invalid"
+        # Saltea el metadata de GCE/Colab (NO_GCE_CHECK). No usar un host
+        # inválido: cada lookup espera el timeout de DNS y parece una descarga
+        # trabada en 0 B.
+        env["NO_GCE_CHECK"] = "True"
+        env["GCE_METADATA_TIMEOUT"] = "0"
         return env
+
+    @staticmethod
+    def _bytes_on_disk(destination_file: Path) -> int:
+        """Incluye ``.gstmp`` / slices al lado del destino (gsutil no escribe el .partial hasta el final)."""
+        parent = destination_file.parent
+        if not parent.is_dir():
+            return 0
+        total = 0
+        prefix = destination_file.name
+        for path in parent.iterdir():
+            if not path.is_file():
+                continue
+            if path.suffix == ".log" or not path.name.startswith(prefix):
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
 
     def _run_copy_with_progress(self, cmd: list[str], destination_file: Path, env: dict[str, str]) -> bool:
         log_path = destination_file.with_name(destination_file.name + ".log")
+        started = time.monotonic()
         with log_path.open("wb") as log_f:
             try:
                 proc = subprocess.Popen(cmd, env=env, stdout=log_f, stderr=subprocess.STDOUT)
@@ -139,8 +161,9 @@ class DatasetRepository:
                 time.sleep(1.0)
                 now = time.monotonic()
                 if now - last_print >= _PROGRESS_EVERY_S:
-                    size = destination_file.stat().st_size if destination_file.exists() else 0
-                    print(f"[download] {self._format_bytes(size)}", flush=True)
+                    size = self._bytes_on_disk(destination_file)
+                    elapsed = now - started
+                    print(f"[download] {self._format_bytes(size)} ({elapsed:.0f}s)", flush=True)
                     last_print = now
             code = proc.wait()
         if code != 0:
@@ -153,9 +176,31 @@ class DatasetRepository:
         log_path.unlink(missing_ok=True)
         return destination_file.is_file() and destination_file.stat().st_size > 0
 
+    @staticmethod
+    def _gsutil_has_compiled_crcmod(gsutil: str) -> bool:
+        env = os.environ.copy()
+        env["NO_GCE_CHECK"] = "True"
+        env["GCE_METADATA_TIMEOUT"] = "0"
+        try:
+            proc = subprocess.run(
+                [gsutil, "version", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+                env=env,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        text = f"{proc.stdout}\n{proc.stderr}".lower()
+        return "compiled crcmod: true" in text
+
     def _download_with_gsutil(self, source: str, destination_file: Path) -> bool:
         gsutil = shutil.which("gsutil")
         if gsutil is None:
+            return False
+        if not self._gsutil_has_compiled_crcmod(gsutil):
+            print("[download] gsutil sin crcmod compilado; no parte en rebanadas, uso curl paralelo", flush=True)
             return False
         print("[download] gsutil anónimo (rebanadas, sin credenciales Colab)", flush=True)
         with tempfile.TemporaryDirectory(prefix="gcs-anon-") as tmp:

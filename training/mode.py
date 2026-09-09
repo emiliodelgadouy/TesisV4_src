@@ -231,42 +231,56 @@ def _clamp_explicit_batch(value) -> int:
     return min(_BATCH_SIZE_CAP, batch)
 
 
+def _lookup_resized_table(config: Mapping, table_key: str, input_size: int | Sequence[int], *, coerce):
+    """Lee ``RESIZED[table_key]`` para un canvas.
+
+    Dict ``{448: valor}`` o lista paralela a ``INPUT_SIZES``. ``None`` si no hay tabla.
+    """
+    raw = dict(config.get("RESIZED") or {}).get(table_key)
+    if raw is None:
+        return None
+    target = normalize_input_size(input_size)
+    if isinstance(raw, Mapping):
+        table = {normalize_input_size(key): coerce(value) for key, value in raw.items()}
+        if target not in table:
+            pretty = ", ".join(resized_size_label(key) for key in table)
+            raise ValueError(
+                f"RESIZED.{table_key} no define valor para {resized_size_label(target)}. Claves: {pretty}."
+            )
+        return table[target]
+    if isinstance(raw, list):
+        sizes = resolve_resized_input_sizes(config)
+        if len(raw) != len(sizes):
+            raise ValueError(
+                f"RESIZED.{table_key} tiene {len(raw)} valores y INPUT_SIZES {len(sizes)}."
+            )
+        for size, value in zip(sizes, raw):
+            if size == target:
+                return coerce(value)
+        raise ValueError(f"RESIZED.{table_key} no define valor para {resized_size_label(target)}.")
+    raise ValueError(
+        f"RESIZED.{table_key} invalido: {raw!r}. Usa un dict {{tamaño: valor}} o una lista paralela a INPUT_SIZES."
+    )
+
+
 def resolve_resized_batch_size(
     config: Mapping,
     input_size: int | Sequence[int],
 ) -> int | None:
     """Batch de ``RESIZED.BATCH_SIZES`` para este canvas, o None si no hay tabla.
 
-    Acepta un dict ``{448: 128, (672, 672): 64}`` o una lista paralela a
-    ``INPUT_SIZES``. Si la tabla existe, el canvas tiene que estar; si no, se
-    sigue el batch del backbone escalado por area.
+    Si la tabla existe, el canvas tiene que estar; si no, se sigue el batch del
+    backbone escalado por area.
     """
-    raw = dict(config.get("RESIZED") or {}).get("BATCH_SIZES")
-    if raw is None:
-        return None
-    target = normalize_input_size(input_size)
-    if isinstance(raw, Mapping):
-        table = {normalize_input_size(key): _clamp_explicit_batch(value) for key, value in raw.items()}
-        batch = table.get(target)
-        if batch is None:
-            pretty = ", ".join(resized_size_label(key) for key in table)
-            raise ValueError(
-                f"RESIZED.BATCH_SIZES no define batch para {resized_size_label(target)}. Claves: {pretty}."
-            )
-        return batch
-    if isinstance(raw, list):
-        sizes = resolve_resized_input_sizes(config)
-        if len(raw) != len(sizes):
-            raise ValueError(
-                f"RESIZED.BATCH_SIZES tiene {len(raw)} valores y INPUT_SIZES {len(sizes)}."
-            )
-        for size, value in zip(sizes, raw):
-            if size == target:
-                return _clamp_explicit_batch(value)
-        raise ValueError(f"RESIZED.BATCH_SIZES no define batch para {resized_size_label(target)}.")
-    raise ValueError(
-        f"RESIZED.BATCH_SIZES invalido: {raw!r}. Usa un dict {{tamaño: batch}} o una lista paralela a INPUT_SIZES."
-    )
+    return _lookup_resized_table(config, "BATCH_SIZES", input_size, coerce=_clamp_explicit_batch)
+
+
+def resolve_resized_cache(
+    config: Mapping,
+    input_size: int | Sequence[int],
+) -> bool | None:
+    """Cache de ``RESIZED.CACHE`` para este canvas, o None si no hay tabla."""
+    return _lookup_resized_table(config, "CACHE", input_size, coerce=bool)
 
 
 def _floor_power_of_two(n: int) -> int:
