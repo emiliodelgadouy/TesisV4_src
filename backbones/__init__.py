@@ -1,7 +1,8 @@
 from .base import Backbone, DEFAULT_WEIGHTS, mode_batch_sizes
-from . import chexnet, custom_tiny, efficientnet, efficientnet_v2, vgg, vit, swin
+from . import chexnet, custom_cnn, custom_tiny, efficientnet, efficientnet_v2, vgg, vit, swin
 from .base import BACKBONES, get_backbone, resolve_backbone
 from .chexnet import CheXNetBackbone
+from .custom_cnn import CustomCnnBackbone
 from .custom_tiny import CustomTinyBackbone
 from .efficientnet import (
     EfficientNetB0Backbone,
@@ -31,6 +32,7 @@ __all__ = [
     "Backbone",
     "DEFAULT_WEIGHTS",
     "CheXNetBackbone",
+    "CustomCnnBackbone",
     "CustomTinyBackbone",
     "EfficientNetB0Backbone",
     "EfficientNetB1Backbone",
