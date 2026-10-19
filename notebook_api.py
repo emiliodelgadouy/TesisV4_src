@@ -25,7 +25,7 @@ from src.training.evaluator import PairedBootstrap, Predictor, ThresholdSelector
 from src.training.experiment import TrainingExperiment
 from src.training.inference import predict_with_weights
 from src.training.mode import resolve_resized_input_sizes
-from src.training.plan import ExperimentPlan, RunSpec, prepare_resume_dir
+from src.training.plan import ExperimentPlan, RunSpec, prepare_resume
 from src.training.resources import RandomSeeds
 
 def login_comet(config) -> None:
@@ -70,7 +70,7 @@ def run_training_experiment(
     experiment_suffix=None,
     dispose_pretrained_builder=True,
     input_size=None,
-    resume_dir=None,
+    resume_store=None,
 ):
     return TrainingExperiment(
         config,
@@ -85,7 +85,7 @@ def run_training_experiment(
         experiment_suffix=experiment_suffix,
         dispose_pretrained_builder=dispose_pretrained_builder,
         input_size=input_size,
-        resume_dir=resume_dir,
+        resume_store=resume_store,
     ).run()
 
 
@@ -117,7 +117,7 @@ __all__ = [
     "predict_probs_and_labels",
     "predict_with_weights",
     "prepare_dataset",
-    "prepare_resume_dir",
+    "prepare_resume",
     "resized_input_sizes",
     "run_training_experiment",
     "set_random_seeds",

@@ -1,9 +1,11 @@
 """Plan de experimentos por fases: correr, saltear lo hecho, retomar y comparar por validacion.
 
-Una corrida (``RunSpec``) se considera hecha si su ``state.json`` en ``RESUME.DIR``
-dice ``done`` o, con ``RESUME.SKIP_IF_IN_COMET``, si Comet ya tiene una corrida
-terminada con el mismo nombre (desde ``RESUME.COMET_DONE_SINCE``). Una corrida a
-medias en ``RESUME.DIR`` se retoma desde la ultima epoca guardada.
+El estado de cada corrida vive en Comet (``RESUME.BACKEND="comet"``, assets
+``resume_*`` del experimento) o en una carpeta (``"dir"``, ``RESUME.DIR``). Una
+corrida se considera hecha si su estado dice ``done`` o, con
+``RESUME.SKIP_IF_IN_COMET``, si Comet ya tiene una corrida terminada con el
+mismo nombre (desde ``RESUME.COMET_DONE_SINCE``). Una corrida a medias se
+retoma desde la ultima epoca guardada.
 
 Las decisiones entre fases miran solo validacion (``val_best_metric``, la
 metrica del checkpoint). Test se muestra al final, con ``show_test=True``.
@@ -19,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from src.tracking.comet_results import CometRunIndex
+from src.tracking.comet_store import CometRunStore
 from src.training.experiment import TrainingExperiment, resolve_experiment_name
 from src.training.inference import build_trained_model
 from src.training.mode import TrainingMode
@@ -57,11 +60,9 @@ class RunSpec:
         return name
 
 
-def prepare_resume_dir(config) -> Path | None:
-    """Resuelve ``RESUME.DIR``; si apunta a Drive y no esta montado, intenta montarlo.
-
-    Sin Drive cae a ``RESUME.FALLBACK_DIR`` (disco de la VM): el avance sobrevive
-    a reiniciar el kernel, no a perder la VM.
+def prepare_resume(config) -> str | None:
+    """Valida ``RESUME``. Con ``BACKEND="dir"`` resuelve ``RESUME.DIR`` y, si apunta
+    a Drive sin montar, intenta montarlo; si no puede, cae a ``RESUME.FALLBACK_DIR``.
     """
     from src.notebook import is_running_in_colab
 
@@ -69,6 +70,12 @@ def prepare_resume_dir(config) -> Path | None:
     if not resume_cfg.get("ENABLED", True):
         print("[resume] desactivado (RESUME.ENABLED=False)")
         return None
+    backend = resume_cfg.setdefault("BACKEND", "comet")
+    if backend == "comet":
+        print(f"[resume] estado y pesos como assets resume_* del experimento en Comet ({config['COMET']['PROJECT_NAME']})")
+        return "comet"
+    if backend != "dir":
+        raise ValueError(f"RESUME.BACKEND debe ser 'comet' o 'dir', no {backend!r}")
     target = Path(resume_cfg.get("DIR") or "runs")
     under_drive = target.is_absolute() and DRIVE_ROOT in target.parents
     if under_drive and not (DRIVE_ROOT / "MyDrive").is_dir():
@@ -101,21 +108,40 @@ class ExperimentPlan:
         self.val_df = val_df
         self.test_df = test_df
         resume_cfg = config.get("RESUME") or {}
-        self.resume_dir = resume_cfg.get("DIR") if resume_cfg.get("ENABLED", True) else None
+        self.backend = resume_cfg.get("BACKEND", "comet") if resume_cfg.get("ENABLED", True) else None
+        self.resume_dir = resume_cfg.get("DIR") or "runs"
         self.skip_if_in_comet = bool(resume_cfg.get("SKIP_IF_IN_COMET", True))
         self.comet = CometRunIndex(config, done_since=resume_cfg.get("COMET_DONE_SINCE"))
         plan_cfg = config.get("PLAN") or {}
         self.margin = float(plan_cfg.get("MARGIN", DEFAULT_MARGIN))
         self.weights_cache = Path(plan_cfg.get("WEIGHTS_CACHE", "checkpoints/comet"))
+        self._stores: dict = {}
+        self._summaries: dict[str, dict] = {}
 
     def name(self, spec: RunSpec) -> str:
         return spec.name(self.config)
 
-    def _store(self, spec: RunSpec) -> RunStore | None:
-        return RunStore(self.resume_dir, self.name(spec)) if self.resume_dir else None
+    def _store(self, spec: RunSpec):
+        if self.backend is None:
+            return None
+        name = self.name(spec)
+        if name not in self._stores:
+            if self.backend == "comet":
+                self._stores[name] = CometRunStore(self.comet, name)
+            else:
+                self._stores[name] = RunStore(self.resume_dir, name)
+        return self._stores[name]
+
+    def _remember(self, name: str, summary: dict | None) -> None:
+        if summary:
+            self._summaries[name] = {**summary, "source": "run"}
+        self.comet.forget(name)
 
     def status(self, spec: RunSpec) -> tuple[str, dict | None]:
         """``done`` | ``partial`` | ``comet`` | ``pending`` y el resumen si existe."""
+        name = self.name(spec)
+        if name in self._summaries:
+            return "done", self._summaries[name]
         store = self._store(spec)
         state = store.load() if store is not None else None
         if state and state.get("status") == "done":
@@ -165,13 +191,20 @@ class ExperimentPlan:
             self.test_df,
             experiment_suffix=spec.suffix,
             input_size=spec.input_size,
-            resume_dir=self.resume_dir,
+            resume_store=self._store(spec),
             **kwargs,
         )
 
+    def _fresh_status(self, spec: RunSpec) -> tuple[str, dict | None]:
+        """Relee el estado: otra sesion (o un intento fallido en esta) pudo haberlo cambiado."""
+        store = self._store(spec)
+        if store is not None:
+            store.reload()
+        return self.status(spec)
+
     def run(self, spec: RunSpec) -> dict:
         name = self.name(spec)
-        status, summary = self.status(spec)
+        status, summary = self._fresh_status(spec)
         if status in ("done", "comet"):
             print(f"[plan] {name}: ya terminada ({status}); se saltea")
             return summary
@@ -180,8 +213,12 @@ class ExperimentPlan:
         RandomSeeds.set(config)
         pretrained = self.trained_builder(spec.pretrained) if spec.pretrained is not None else None
         experiment = self._experiment(spec, config, pretrained_builder=pretrained, return_summary=True)
-        experiment.run()
-        return {**(experiment.summary or {}), "source": "run"}
+        try:
+            experiment.run()
+        finally:
+            self.comet.forget(name)
+        self._remember(name, experiment.summary)
+        return self._summaries.get(name, {})
 
     def run_all(self, specs) -> pd.DataFrame:
         for spec in specs:
@@ -191,12 +228,18 @@ class ExperimentPlan:
     def trained_builder(self, spec: RunSpec):
         """Builder entrenado de ``spec`` (para transferir): entrena si falta, si no carga pesos."""
         name = self.name(spec)
-        status, summary = self.status(spec)
+        status, summary = self._fresh_status(spec)
         if status in ("pending", "partial"):
             print(f"\n[plan] {name}: entreno el encoder a transferir")
             config = self._config_for(spec)
             RandomSeeds.set(config)
-            return self._experiment(spec, config, return_builder=True).run()
+            experiment = self._experiment(spec, config, return_builder=True)
+            try:
+                builder = experiment.run()
+            finally:
+                self.comet.forget(name)
+            self._remember(name, experiment.summary)
+            return builder
         weights = self._final_weights(spec, status)
         print(f"[plan] {name}: cargo pesos ya entrenados ({weights})")
         return build_trained_model(
@@ -211,7 +254,7 @@ class ExperimentPlan:
     def _final_weights(self, spec: RunSpec, status: str) -> Path:
         name = self.name(spec)
         store = self._store(spec)
-        if status == "done" and store is not None:
+        if status == "done" and isinstance(store, RunStore):
             state = store.load() or {}
             for entry in state.get("best_checkpoints", []):
                 if store.has_file(entry.get("file")):

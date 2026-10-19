@@ -76,7 +76,12 @@ class CometRunIndex:
         self._by_name = by_name
         self._finished = {}
 
-    def _candidates(self, name: str) -> list:
+    def forget(self, name: str) -> None:
+        """Invalida lo cacheado para ``name`` (p. ej. despues de correrla en esta sesion)."""
+        self._finished.pop(name, None)
+        self._by_name = None
+
+    def _candidates(self, name: str, *, apply_since: bool = True) -> list:
         if self._by_name is None:
             self.refresh()
         rows = []
@@ -84,11 +89,17 @@ class CometRunIndex:
             meta = exp.get_metadata() or {}
             start_ms = int(meta.get("startTimeMillis") or 0)
             started = datetime.fromtimestamp(start_ms / 1000).astimezone() if start_ms else None
-            if self.done_since and (started is None or started.date() < self.done_since):
+            if apply_since and self.done_since and (started is None or started.date() < self.done_since):
                 continue
             rows.append((start_ms, started, exp))
         rows.sort(key=lambda row: row[0], reverse=True)
         return rows
+
+    def experiments_named(self, name: str, *, fresh: bool = False) -> list:
+        """Experimentos no archivados con ese nombre, el mas nuevo primero (sin corte de fecha)."""
+        if fresh:
+            self._by_name = None
+        return [exp for _, _, exp in self._candidates(name, apply_since=False)]
 
     def finished(self, name: str) -> dict | None:
         """Resumen de la corrida terminada mas reciente con ese nombre, o None."""

@@ -14,7 +14,7 @@ from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
 from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
 from src.training.resources import GpuResources
-from src.training.resume import RunStore, TrainingResume, epochs_completed
+from src.training.resume import TrainingResume, epochs_completed
 from src.training.stage_runner import TrainingStageRunner
 from src.training.timer import TrainingTimer, sample_memory_usage
 
@@ -62,8 +62,9 @@ class TrainingExperiment:
         experiment_suffix=None,
         dispose_pretrained_builder=True,
         input_size=None,
-        resume_dir=None,
+        resume_store=None,
     ) -> None:
+        """``resume_store``: ``RunStore`` / ``CometRunStore`` de esta corrida (ver ``plan.py``)."""
         self.config = config
         self.mode_name_raw = mode
         self.mode = TrainingMode.parse(mode)
@@ -77,7 +78,7 @@ class TrainingExperiment:
         self.experiment_suffix = experiment_suffix
         self.dispose_pretrained_builder = dispose_pretrained_builder
         self.requested_input_size = input_size
-        self.resume_dir = resume_dir
+        self.resume_store = resume_store
         self.summary = None
 
     def run(self):
@@ -117,14 +118,16 @@ class TrainingExperiment:
             input_size=self.requested_input_size,
             suffix=self.experiment_suffix,
         )
-        resume = TrainingResume(RunStore(self.resume_dir, exp_name)) if self.resume_dir else None
+        if self.resume_store is not None and self.resume_store.experiment_name != exp_name:
+            raise ValueError(f"resume_store es de {self.resume_store.experiment_name!r}, no de {exp_name!r}")
+        resume = TrainingResume(self.resume_store) if self.resume_store is not None else None
         if resume is not None and resume.is_done:
             if self.return_builder:
                 raise ValueError(
-                    f"{exp_name} ya esta terminada en {resume.store.dir}; para reutilizar "
+                    f"{exp_name} ya esta terminada en {resume.store.location}; para reutilizar "
                     "el encoder usar ExperimentPlan (carga los pesos sin reentrenar)"
                 )
-            print(f"[resume] {exp_name}: ya terminada ({resume.store.dir}); se saltea")
+            print(f"[resume] {exp_name}: ya terminada ({resume.store.location}); se saltea")
             self.summary = resume.summary
             return self.summary if self.return_summary else None
 
@@ -291,7 +294,7 @@ class TrainingExperiment:
             if resume is not None:
                 resume.begin(comet_key)
                 experiment.log_parameter("RESUME_COUNT", resume.resume_count)
-                experiment.log_other("resume_dir", str(resume.store.dir))
+                experiment.log_other("resume_store", resume.store.location)
             if not tracker.resumed:
                 tracker.log_dataset_class_counts(train=train_df, val=val_df, test=test_df)
                 tracker.log_deterministic_input_samples(

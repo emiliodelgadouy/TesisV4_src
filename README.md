@@ -9,7 +9,7 @@ src/
   notebook_api.py             # fachada del notebook (import * y __all__)
   dataset/                    # GCS, etiqueta, splits, tf.data, CLAHE, MixUp
   training/                   # modos, experimento, etapas, umbrales, resume, plan
-  tracking/                   # CometTracker, CometRunIndex
+  tracking/                   # CometTracker, CometRunIndex, CometRunStore
   model_builder/              # grafo Keras por modo
   backbones/                  # extractores registrados por key
 ```
@@ -46,12 +46,20 @@ comentados y también pasan por `plan.run`.
 
 ## Resume
 
-`RESUME.DIR` (Drive en Colab) guarda una carpeta por corrida con `state.json`,
-los pesos de la última época y el mejor checkpoint de cada etapa
-(`training/resume.py`). Si la sesión se corta, volver a correr el notebook:
+Cada corrida guarda su estado, los pesos de la última época y el mejor
+checkpoint de cada etapa (`training/resume.py`) en un store:
 
-- `done`: se saltea. Queda solo el mejor checkpoint global, que sirve para
-  transferir o reevaluar sin reentrenar.
+- `RESUME.BACKEND="comet"` (default, `tracking/comet_store.py`): assets
+  `resume_*` del experimento de la corrida, subidos por la REST API en un
+  thread. El estado lleva versión (`resume_state_{N}.json`). Un commit sube los
+  pesos que faltan, después el estado, y recién entonces borra estados viejos y
+  pesos que ya no se referencian.
+- `RESUME.BACKEND="dir"`: una carpeta por corrida en `RESUME.DIR`.
+
+Si la sesión se corta, volver a correr el notebook:
+
+- `done`: se saltea. Comet conserva solo los pesos finales (`log_model`); el
+  store en carpeta conserva el mejor checkpoint global.
 - `training` / `trained`: se saltean las etapas completas, la etapa a medias
   sigue desde la última época (`initial_epoch`) y el log sigue en el mismo
   experimento de Comet (`experiment_key` + `mode="get"`).
@@ -60,8 +68,7 @@ los pesos de la última época y el mejor checkpoint de cada etapa
   hace falta transferirlos.
 
 Se restauran pesos, learning rate y contadores de EarlyStopping y
-ReduceLROnPlateau; los momentos de Adam no. `prepare_resume_dir()` monta Drive
-si hace falta; si no puede, cae a `RESUME.FALLBACK_DIR` en la VM.
+ReduceLROnPlateau; los momentos de Adam no.
 
 `training/inference.py` reconstruye un modelo entrenado desde un `.weights.h5`
 y predice un DataFrame en el orden de sus filas (`predict_with_weights`);
