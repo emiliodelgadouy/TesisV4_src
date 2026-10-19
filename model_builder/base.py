@@ -236,8 +236,8 @@ class BaseModelBuilder(ABC):
     def callbacks(self, training_timer=None):
         return self.trainer.callbacks(training_timer=training_timer)
 
-    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None, epoch_offset=0):
-        return self.trainer.fit(train_ds, val_ds, epochs=epochs, callbacks=callbacks, training_timer=training_timer, stage=stage, epoch_offset=epoch_offset)
+    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None, epoch_offset=0, initial_epoch=0):
+        return self.trainer.fit(train_ds, val_ds, epochs=epochs, callbacks=callbacks, training_timer=training_timer, stage=stage, epoch_offset=epoch_offset, initial_epoch=initial_epoch)
 
     def load_best_checkpoint(self):
         return self.trainer.load_best_checkpoint()

@@ -174,28 +174,57 @@ def log_training_timing_summary(experiment, training_timer) -> None:
     experiment.log_metrics(metrics)
 
 
+def _resume_experiment(config: dict[str, Any], *, experiment_name: str, experiment_key: str):
+    """Reabre un experimento existente (resume). Devuelve None si Comet no lo encuentra."""
+    try:
+        return comet_ml.start(
+            project_name=config["COMET"]["PROJECT_NAME"],
+            online=config["COMET"].get("ONLINE"),
+            experiment_key=experiment_key,
+            mode="get",
+            experiment_config=comet_ml.ExperimentConfig(
+                name=experiment_name,
+                auto_metric_logging=False,
+            ),
+        )
+    except Exception as exc:
+        print(f"[comet] no pude retomar {experiment_key} ({exc}); se crea un experimento nuevo")
+        return None
+
+
 def start_training_experiment(
     config: dict[str, Any],
     *,
     experiment_name: str,
     run_config: dict[str, Any],
     model=None,
+    experiment_key: str | None = None,
 ):
+    """Devuelve ``(experiment, resumed)``. Con ``experiment_key`` sigue logueando en ese experimento."""
     project_name = config["COMET"]["PROJECT_NAME"]
     online = config["COMET"].get("ONLINE")
-    experiment = comet_ml.start(
-        project_name=project_name,
-        online=online,
-        experiment_config=comet_ml.ExperimentConfig(
-            name=experiment_name,
-            auto_metric_logging=False,
-        ),
-    )
+    experiment = None
+    if experiment_key:
+        experiment = _resume_experiment(config, experiment_name=experiment_name, experiment_key=experiment_key)
+    resumed = experiment is not None
+    if experiment is None:
+        experiment = comet_ml.start(
+            project_name=project_name,
+            online=online,
+            experiment_config=comet_ml.ExperimentConfig(
+                name=experiment_name,
+                auto_metric_logging=False,
+            ),
+        )
     # Evita el callback auto-inyectado de Keras, que loguea por batch step.
     experiment.disable_mp()
+    experiment.log_parameters(run_config)
+    if resumed:
+        experiment.add_tag("resumed")
+        _log_run_timestamp(experiment, "run_resumed_at")
+        return experiment, True
     experiment.set_step(0)
     experiment.set_epoch(0)
-    experiment.log_parameters(run_config)
     _log_run_timestamp(experiment, "run_started_at")
     metric_to_maximize = run_config.get("METRIC_TO_MAXIMIZE")
     checkpoint_monitor = run_config.get("CHECKPOINT_MONITOR")
@@ -210,7 +239,7 @@ def start_training_experiment(
     if model is not None:
         experiment.set_model_graph(model)
         _log_model_param_counts(experiment, model)
-    return experiment
+    return experiment, False
 
 
 def _log_model_param_counts(experiment, model) -> None:
@@ -836,8 +865,9 @@ def log_test_results(
 class CometTracker:
     """Agrupa login, start, samples, eval y reporte final de Comet ML."""
 
-    def __init__(self, experiment) -> None:
+    def __init__(self, experiment, *, resumed: bool = False) -> None:
         self.experiment = experiment
+        self.resumed = resumed
 
     @staticmethod
     def login(config) -> None:
@@ -851,15 +881,16 @@ class CometTracker:
         experiment_name: str,
         run_config: dict[str, Any],
         model=None,
+        experiment_key: str | None = None,
     ) -> CometTracker:
-        return cls(
-            start_training_experiment(
-                config,
-                experiment_name=experiment_name,
-                run_config=run_config,
-                model=model,
-            )
+        experiment, resumed = start_training_experiment(
+            config,
+            experiment_name=experiment_name,
+            run_config=run_config,
+            model=model,
+            experiment_key=experiment_key,
         )
+        return cls(experiment, resumed=resumed)
 
     @staticmethod
     def log_stage_timing(experiment, stage: int, summary: dict[str, float], *, step: int) -> None:

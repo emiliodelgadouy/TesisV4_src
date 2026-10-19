@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import time
 
-from tensorflow import keras
-
 from src.dataset.provider import as_tf_dataset
+from src.training.resume import epochs_completed, history_with_epochs
 from src.training.timer import TrainingTimer
 
 
@@ -44,13 +43,23 @@ class TrainingStageRunner:
         experiment=None,
         extra_callbacks=None,
         setup_fn=None,
+        resume=None,
     ):
-        """Las epocas de cada etapa (1=frozen, 2=partial, 3=full) salen de ``config["TRAINING"]``."""
+        """Las epocas de cada etapa (1=frozen, 2=partial, 3=full) salen de ``config["TRAINING"]``.
+
+        Con ``resume`` (``TrainingResume``) saltea etapas ya completas, retoma una
+        etapa a medias desde la ultima epoca guardada y registra cada epoca.
+        """
         from src.tracking.comet import CometEpochLogger, CometTracker
 
         if stage not in _STAGE_EPOCH_KEYS:
             raise ValueError(f"stage invalido: {stage!r} (esperado 1, 2 o 3)")
         epochs = config["TRAINING"][_STAGE_EPOCH_KEYS[stage]]
+
+        if resume is not None and resume.stage_finished(stage):
+            done = resume.stage_epochs_done(stage)
+            print(f"  Etapa {stage}: ya completada en una sesion anterior ({done} epocas); se saltea")
+            return history_with_epochs(done), None, None
 
         # El setup de freeze/unfreeze corre aunque se omita el fit, para no saltar fases.
         setup_seconds = 0.0
@@ -60,11 +69,12 @@ class TrainingStageRunner:
             setup_seconds = time.perf_counter() - t0
 
         if epochs <= 0:
-            empty_history = keras.callbacks.History()
-            empty_history.history = {}
             print(f"  Etapa {stage}: omitida (epochs=0)")
-            return empty_history, None, None
+            if resume is not None:
+                resume.finish_stage(stage, 0, summary=None, elapsed_seconds=training_timer.elapsed_since_training_start())
+            return history_with_epochs(0), None, None
 
+        initial_epoch = resume.prepare_stage(stage) if resume is not None else 0
         training_timer.start_stage(stage)
 
         warmup_seconds = self.warmup(model, train_ds)
@@ -81,16 +91,26 @@ class TrainingStageRunner:
                     monitor=getattr(model, "checkpoint_monitor", None),
                 ),
             )
-        history = model.fit(
-            train_ds,
-            val_ds,
-            epochs=epochs,
-            callbacks=callbacks,
-            training_timer=training_timer,
-            stage=stage,
-            epoch_offset=epoch_offset,
-        )
+        if resume is not None:
+            callbacks.append(resume.callback(stage, training_timer=training_timer))
+        if initial_epoch < epochs:
+            history = model.fit(
+                train_ds,
+                val_ds,
+                epochs=epochs,
+                callbacks=callbacks,
+                training_timer=training_timer,
+                stage=stage,
+                epoch_offset=epoch_offset,
+                initial_epoch=initial_epoch,
+            )
+        else:
+            # Se cortó despues de la ultima epoca y antes de cerrar la etapa.
+            model.trainer.fit_number = int(stage)
+            model.trainer.epoch_offset = int(epoch_offset)
+            history = history_with_epochs(initial_epoch)
         fit_seconds = time.perf_counter() - fit_t0
+        stage_epochs = max(epochs_completed(history), initial_epoch)
 
         ckpt_t0 = time.perf_counter()
         restore_info = model.load_best_checkpoint()
@@ -103,8 +123,14 @@ class TrainingStageRunner:
             fit_seconds=fit_seconds,
             checkpoint_seconds=checkpoint_seconds,
         )
-        epochs_completed = len(history.history.get("loss", []))
-        global_epoch = epoch_offset + epochs_completed
+        if resume is not None:
+            resume.finish_stage(
+                stage,
+                stage_epochs,
+                summary=summary,
+                elapsed_seconds=training_timer.elapsed_since_training_start(),
+            )
+        global_epoch = epoch_offset + stage_epochs
         if experiment is not None:
             CometTracker.log_stage_timing(experiment, stage, summary, step=global_epoch)
             if restore_info is not None:

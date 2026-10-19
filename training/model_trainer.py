@@ -76,7 +76,9 @@ class ModelTrainer:
     def checkpoint_callback(self):
         monitor = self.builder.checkpoint_monitor
         stage = self.fit_number
-        best_value = {monitor: None}
+        # Al reanudar una etapa, el mejor valor ya visto viene de best_checkpoints.
+        previous = next((info["value"] for info in self.best_checkpoints if info["stage"] == stage), None)
+        best_value = {monitor: previous}
 
         def on_epoch_end(epoch, logs):
             logs = logs or {}
@@ -118,15 +120,18 @@ class ModelTrainer:
         return keras.callbacks.ReduceLROnPlateau(monitor=builder.checkpoint_monitor, mode=builder.monitor_mode, factor=builder.reduce_lr_factor, patience=builder.reduce_lr_patience, min_lr=builder.min_lr, verbose=1)
 
     def callbacks(self, training_timer=None):
+        # Referencias para que el resume lea/restaure sus contadores.
+        self.early_stopping = self.early_stopping_callback()
+        self.reduce_lr = self.reduce_lr_callback()
         return [
             self.checkpoint_callback(),
-            self.early_stopping_callback(),
-            self.reduce_lr_callback(),
+            self.early_stopping,
+            self.reduce_lr,
             EpochTimer(training_timer=training_timer),
             MemoryEpochLogger(),
         ]
 
-    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None, epoch_offset=0):
+    def fit(self, train_ds, val_ds, epochs=5, callbacks=None, training_timer=None, stage=None, epoch_offset=0, initial_epoch=0):
         # ``stage`` explicito alinea nombres on-disk con Comet aunque se omitan etapas.
         # ``epoch_offset`` no cambia el conteo local de Keras; solo indexa Comet y ``global_epoch``.
         if stage is not None:
@@ -138,7 +143,7 @@ class ModelTrainer:
         self.checkpoint_path = self.checkpoint_dir / f"{stage_stem}.weights.h5"
         from src.dataset.provider import as_tf_dataset
 
-        return self.builder.model.fit(as_tf_dataset(train_ds), validation_data=as_tf_dataset(val_ds), epochs=epochs, callbacks=self.callbacks(training_timer=training_timer) + list(callbacks or []))
+        return self.builder.model.fit(as_tf_dataset(train_ds), validation_data=as_tf_dataset(val_ds), epochs=epochs, initial_epoch=int(initial_epoch), callbacks=self.callbacks(training_timer=training_timer) + list(callbacks or []))
 
     def load_best_checkpoint(self):
         info = next((item for item in self.best_checkpoints if item["stage"] == self.fit_number), None)

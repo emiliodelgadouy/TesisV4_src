@@ -21,9 +21,11 @@ from src.dataset.preparer import DatasetPreparer
 from src.dataset.provider import build_dataset_provider
 from src.dataset.splits import SplitManager
 from src.tracking.comet import CometTracker
-from src.training.evaluator import Predictor, ThresholdSelector
+from src.training.evaluator import PairedBootstrap, Predictor, ThresholdSelector
 from src.training.experiment import TrainingExperiment
+from src.training.inference import predict_with_weights
 from src.training.mode import resolve_resized_input_sizes
+from src.training.plan import ExperimentPlan, RunSpec, prepare_resume_dir
 from src.training.resources import RandomSeeds
 
 def login_comet(config) -> None:
@@ -68,6 +70,7 @@ def run_training_experiment(
     experiment_suffix=None,
     dispose_pretrained_builder=True,
     input_size=None,
+    resume_dir=None,
 ):
     return TrainingExperiment(
         config,
@@ -82,7 +85,12 @@ def run_training_experiment(
         experiment_suffix=experiment_suffix,
         dispose_pretrained_builder=dispose_pretrained_builder,
         input_size=input_size,
+        resume_dir=resume_dir,
     ).run()
+
+
+def paired_auc_delta(y_true, prob_ref, prob_alt, *, groups=None, samples: int = 1000, seed: int = 42):
+    return PairedBootstrap.auc_delta(y_true, prob_ref, prob_alt, groups=groups, samples=samples, seed=seed)
 
 
 def resized_input_sizes(config, backbone_name=None):
@@ -99,12 +107,17 @@ __all__ = [
     "np",
     "pd",
     "tf",
+    "ExperimentPlan",
+    "RunSpec",
     "apply_probability_threshold",
     "build_dataset_provider",
     "get_dataset_splits",
     "login_comet",
+    "paired_auc_delta",
     "predict_probs_and_labels",
+    "predict_with_weights",
     "prepare_dataset",
+    "prepare_resume_dir",
     "resized_input_sizes",
     "run_training_experiment",
     "set_random_seeds",

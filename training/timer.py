@@ -11,11 +11,14 @@ class TrainingTimer:
     def __init__(self) -> None:
         self._training_start: float | None = None
         self._stage_start: float | None = None
+        self._offset_seconds = 0.0
         self.current_stage: int | None = None
         self.stage_summaries: dict[int, dict[str, float]] = {}
 
-    def start_training(self) -> None:
+    def start_training(self, offset_seconds: float = 0.0) -> None:
+        """``offset_seconds``: tiempo ya entrenado en sesiones anteriores (resume)."""
         self._training_start = time.perf_counter()
+        self._offset_seconds = float(offset_seconds)
 
     def start_stage(self, stage: int) -> None:
         self.current_stage = stage
@@ -24,7 +27,7 @@ class TrainingTimer:
     def elapsed_since_training_start(self) -> float:
         if self._training_start is None:
             return 0.0
-        return time.perf_counter() - self._training_start
+        return self._offset_seconds + time.perf_counter() - self._training_start
 
     def elapsed_since_stage_start(self) -> float:
         if self._stage_start is None:

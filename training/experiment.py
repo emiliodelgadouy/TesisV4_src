@@ -14,8 +14,34 @@ from src.tracking.comet import CometTracker
 from src.training.evaluator import Predictor, ThresholdSelector
 from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
 from src.training.resources import GpuResources
+from src.training.resume import RunStore, TrainingResume, epochs_completed
 from src.training.stage_runner import TrainingStageRunner
 from src.training.timer import TrainingTimer, sample_memory_usage
+
+
+def resolve_experiment_name(config, mode, backbone_name, *, input_size=None, suffix=None):
+    """Nombre Comet/checkpoint de una corrida y el input_size que va a usar.
+
+    Es el mismo calculo que hace ``TrainingExperiment.run``; el runner de fases
+    lo usa para saber si una corrida ya existe antes de construir nada.
+    """
+    mode_name_raw = mode
+    mode = TrainingMode.parse(mode)
+    native_size = get_backbone(backbone_name).input_size
+    builder_cls = ModelBuilderFactory.class_for(mode)
+    resolved_size = builder_cls.resolve_input_size(
+        config,
+        native_size=native_size,
+        requested=input_size,
+        mode_name_raw=mode_name_raw,
+    )
+    name = builder_cls.experiment_name(
+        backbone_name,
+        mode=mode,
+        input_size=resolved_size,
+        suffix=suffix,
+    )
+    return name, resolved_size
 
 
 class TrainingExperiment:
@@ -36,6 +62,7 @@ class TrainingExperiment:
         experiment_suffix=None,
         dispose_pretrained_builder=True,
         input_size=None,
+        resume_dir=None,
     ) -> None:
         self.config = config
         self.mode_name_raw = mode
@@ -50,6 +77,8 @@ class TrainingExperiment:
         self.experiment_suffix = experiment_suffix
         self.dispose_pretrained_builder = dispose_pretrained_builder
         self.requested_input_size = input_size
+        self.resume_dir = resume_dir
+        self.summary = None
 
     def run(self):
         config = self.config
@@ -81,24 +110,28 @@ class TrainingExperiment:
         # de la lista discreta CONFIG["RESIZED"]["INPUT_SIZES"].
         native_size = get_backbone(backbone_name).input_size
         builder_cls = ModelBuilderFactory.class_for(mode)
-        input_size = builder_cls.resolve_input_size(
+        exp_name, input_size = resolve_experiment_name(
             config,
-            native_size=native_size,
-            requested=self.requested_input_size,
-            mode_name_raw=self.mode_name_raw,
+            self.mode_name_raw,
+            backbone_name,
+            input_size=self.requested_input_size,
+            suffix=self.experiment_suffix,
         )
+        resume = TrainingResume(RunStore(self.resume_dir, exp_name)) if self.resume_dir else None
+        if resume is not None and resume.is_done:
+            if self.return_builder:
+                raise ValueError(
+                    f"{exp_name} ya esta terminada en {resume.store.dir}; para reutilizar "
+                    "el encoder usar ExperimentPlan (carga los pesos sin reentrenar)"
+                )
+            print(f"[resume] {exp_name}: ya terminada ({resume.store.dir}); se saltea")
+            self.summary = resume.summary
+            return self.summary if self.return_summary else None
 
         experiment = model = builder = backbone = dataset_provider = train_ds = val_ds = (
             ds_test
         ) = result_builder = summary = pretrain_best = None
         GpuResources.release(clear_keras_session=pretrained_builder is None)
-
-        exp_name = builder_cls.experiment_name(
-            backbone_name,
-            mode=mode,
-            input_size=input_size,
-            suffix=self.experiment_suffix,
-        )
         is_mil_run = TrainingMode.is_mil(mode)
         batch_size, batch_size_source, batch_size_base = resolve_batch_size(
             config,
@@ -243,61 +276,60 @@ class TrainingExperiment:
             run_config["MONITOR_MODE"] = builder.monitor_mode
             run_config["METRIC_TO_MAXIMIZE"] = builder.metric_to_maximize
 
+            if resume is not None:
+                resume.attach(model)
+
             tracker = CometTracker.start(
-                config, experiment_name=exp_name, run_config=run_config, model=model.model
+                config,
+                experiment_name=exp_name,
+                run_config=run_config,
+                model=model.model,
+                experiment_key=resume.comet_key if resume is not None else None,
             )
             experiment = tracker.experiment
-            tracker.log_dataset_class_counts(train=train_df, val=val_df, test=test_df)
-            tracker.log_deterministic_input_samples(
-                config, train_ds, experiment_name=exp_name, split_name="train"
-            )
+            comet_key = experiment.get_key()
+            if resume is not None:
+                resume.begin(comet_key)
+                experiment.log_parameter("RESUME_COUNT", resume.resume_count)
+                experiment.log_other("resume_dir", str(resume.store.dir))
+            if not tracker.resumed:
+                tracker.log_dataset_class_counts(train=train_df, val=val_df, test=test_df)
+                tracker.log_deterministic_input_samples(
+                    config, train_ds, experiment_name=exp_name, split_name="train"
+                )
 
             training_timer = TrainingTimer()
-            training_timer.start_training()
+            training_timer.start_training(offset_seconds=resume.elapsed_seconds if resume is not None else 0.0)
+            if resume is not None:
+                resume.restore_timer(training_timer)
             epoch_offset = 0
             stage_runner = TrainingStageRunner()
-
-            history_frozen, _, _ = stage_runner.run(
-                config,
-                model,
-                train_ds,
-                val_ds,
-                stage=1,
-                training_timer=training_timer,
-                epoch_offset=epoch_offset,
-                experiment=experiment,
-            )
-            epoch_offset += len(history_frozen.history.get("loss", []))
-
-            history_partial, _, _ = stage_runner.run(
-                config,
-                model,
-                train_ds,
-                val_ds,
-                stage=2,
-                training_timer=training_timer,
-                epoch_offset=epoch_offset,
-                experiment=experiment,
-                setup_fn=lambda: model.make_backbone_partially_trainable(
+            stage_setups = {
+                1: None,
+                2: lambda: model.make_backbone_partially_trainable(
                     trainable_fraction=training["BACKBONE_TRAINABLE_FRACTION"],
                     learning_rate=1e-4,
                 ),
-            )
-            epoch_offset += len(history_partial.history.get("loss", []))
-
-            stage_runner.run(
-                config,
-                model,
-                train_ds,
-                val_ds,
-                stage=3,
-                training_timer=training_timer,
-                epoch_offset=epoch_offset,
-                experiment=experiment,
-                setup_fn=lambda: model.make_backbone_trainable(
+                3: lambda: model.make_backbone_trainable(
                     trainable=True, learning_rate=1e-5
                 ),
-            )
+            }
+            for stage, setup_fn in stage_setups.items():
+                history, _, _ = stage_runner.run(
+                    config,
+                    model,
+                    train_ds,
+                    val_ds,
+                    stage=stage,
+                    training_timer=training_timer,
+                    epoch_offset=epoch_offset,
+                    experiment=experiment,
+                    setup_fn=setup_fn,
+                    resume=resume,
+                )
+                epoch_offset += epochs_completed(history)
+            if resume is not None:
+                resume.mark_trained()
             tracker.log_training_timing_summary(training_timer)
             best_global_checkpoint = model.load_best_global_checkpoint()
             tracker.log_global_checkpoint_restore(best_global_checkpoint)
@@ -385,45 +417,52 @@ class TrainingExperiment:
             )
             experiment = None  # ya cerrado por log_test_results; evita doble end() en finally
 
-            if self.return_summary:
-                from sklearn.metrics import average_precision_score, roc_auc_score
+            from sklearn.metrics import average_precision_score, roc_auc_score
 
-                summary = {
-                    "experiment": exp_name,
-                    "mode": mode,
-                    "backbone": backbone_name,
-                    "input_size": list(input_size),
-                    "val_best_metric_name": str(best_global_checkpoint["monitor"]),
-                    "val_best_metric": float(best_global_checkpoint["value"]),
-                    "restore_epoch": int(best_global_checkpoint["global_epoch"]),
-                    "restore_stage": int(best_global_checkpoint["stage"]),
-                    "final_weights_file": str(best_global_checkpoint["path"]),
-                    "test_roc_auc": float(roc_auc_score(y_test_true, y_test_prob)),
-                    "test_pr_auc": float(average_precision_score(y_test_true, y_test_prob)),
-                    "thr_youden": float(thr_youden),
-                    "training_wall_seconds": float(
-                        training_timer.elapsed_since_training_start()
-                    ),
-                    "comet_url": comet_url,
-                    **bootstrap_intervals,
-                    **sample_memory_usage(),
-                }
-                for stage, stage_summary in training_timer.stage_summaries.items():
-                    for key, value in stage_summary.items():
-                        summary[f"stage_{stage}_{key}"] = float(value)
-                monitor_name = str(best_global_checkpoint["monitor"])
-                summary[f"val_best_{monitor_name.removeprefix('val_')}"] = float(
-                    best_global_checkpoint["value"]
-                )
-                if prediction_paths:
-                    summary["train_predictions_file"] = str(prediction_paths["train"])
-                    summary["val_predictions_file"] = str(prediction_paths["val"])
-                    summary["test_predictions_file"] = str(prediction_paths["test"])
-                    summary["predictions_file"] = str(prediction_paths["test"])
-                if pretrain_best is not None:
-                    summary["pretrained_checkpoint"] = str(pretrain_best["path"])
-                    summary["pretrained_best_metric"] = float(pretrain_best["value"])
-                    summary["pretrained_best_metric_name"] = str(pretrain_best["monitor"])
+            summary = {
+                "experiment": exp_name,
+                "mode": mode,
+                "backbone": backbone_name,
+                "input_size": list(input_size),
+                "val_best_metric_name": str(best_global_checkpoint["monitor"]),
+                "val_best_metric": float(best_global_checkpoint["value"]),
+                "restore_epoch": int(best_global_checkpoint["global_epoch"]),
+                "restore_stage": int(best_global_checkpoint["stage"]),
+                "final_weights_file": str(best_global_checkpoint["path"]),
+                "val_roc_auc": float(roc_auc_score(y_val_true, y_val_prob)),
+                "val_pr_auc": float(average_precision_score(y_val_true, y_val_prob)),
+                "test_roc_auc": float(roc_auc_score(y_test_true, y_test_prob)),
+                "test_pr_auc": float(average_precision_score(y_test_true, y_test_prob)),
+                "thr_youden": float(thr_youden),
+                "training_wall_seconds": float(
+                    training_timer.elapsed_since_training_start()
+                ),
+                "comet_url": comet_url,
+                "comet_key": comet_key,
+                "random_seed": int(general["RANDOM_SEED"]),
+                **bootstrap_intervals,
+                **sample_memory_usage(),
+            }
+            for stage, stage_summary in training_timer.stage_summaries.items():
+                for key, value in stage_summary.items():
+                    summary[f"stage_{stage}_{key}"] = float(value)
+            monitor_name = str(best_global_checkpoint["monitor"])
+            summary[f"val_best_{monitor_name.removeprefix('val_')}"] = float(
+                best_global_checkpoint["value"]
+            )
+            if prediction_paths:
+                summary["train_predictions_file"] = str(prediction_paths["train"])
+                summary["val_predictions_file"] = str(prediction_paths["val"])
+                summary["test_predictions_file"] = str(prediction_paths["test"])
+                summary["predictions_file"] = str(prediction_paths["test"])
+            if pretrain_best is not None:
+                summary["pretrained_checkpoint"] = str(pretrain_best["path"])
+                summary["pretrained_best_metric"] = float(pretrain_best["value"])
+                summary["pretrained_best_metric_name"] = str(pretrain_best["monitor"])
+            if resume is not None:
+                summary["resume_count"] = resume.resume_count
+                resume.mark_done(summary, best_file=Path(best_global_checkpoint["path"]).name)
+            self.summary = summary
 
             if self.return_builder:
                 model.pretraining_mode = mode

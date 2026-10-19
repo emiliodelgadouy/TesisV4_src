@@ -65,6 +65,67 @@ class Predictor:
         return y_true, y_prob
 
 
+class PairedBootstrap:
+    """Comparacion de dos modelos sobre las mismas imagenes (bootstrap pareado)."""
+
+    @staticmethod
+    def auc_delta(y_true, prob_ref, prob_alt, *, groups=None, samples: int = 1000, seed: int = 42) -> dict[str, float]:
+        """ROC-AUC y PR-AUC de ``alt - ref`` con IC 95 %.
+
+        Remuestrea grupos (p. ej. paciente) si se pasan; si no, imagenes por clase.
+        """
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        prob_ref = np.asarray(prob_ref, dtype=np.float64).reshape(-1)
+        prob_alt = np.asarray(prob_alt, dtype=np.float64).reshape(-1)
+        rng = np.random.default_rng(seed)
+        if groups is not None:
+            groups = np.asarray(groups).reshape(-1)
+            uniq = np.unique(groups)
+            index_by_group = [np.flatnonzero(groups == group) for group in uniq]
+
+            def draw():
+                picked = rng.integers(0, len(uniq), size=len(uniq))
+                return np.concatenate([index_by_group[i] for i in picked])
+        else:
+            positive = np.flatnonzero(y_true == 1)
+            negative = np.flatnonzero(y_true == 0)
+
+            def draw():
+                return np.concatenate(
+                    [
+                        rng.choice(positive, size=len(positive), replace=True),
+                        rng.choice(negative, size=len(negative), replace=True),
+                    ]
+                )
+
+        out = {
+            "roc_auc_ref": float(roc_auc_score(y_true, prob_ref)),
+            "roc_auc_alt": float(roc_auc_score(y_true, prob_alt)),
+            "pr_auc_ref": float(average_precision_score(y_true, prob_ref)),
+            "pr_auc_alt": float(average_precision_score(y_true, prob_alt)),
+        }
+        roc_delta, pr_delta = [], []
+        for _ in range(int(samples) * 5):
+            if len(roc_delta) >= samples:
+                break
+            idx = draw()
+            yt = y_true[idx]
+            if np.unique(yt).size < 2:
+                continue
+            roc_delta.append(roc_auc_score(yt, prob_alt[idx]) - roc_auc_score(yt, prob_ref[idx]))
+            pr_delta.append(average_precision_score(yt, prob_alt[idx]) - average_precision_score(yt, prob_ref[idx]))
+        out["roc_auc_delta"] = out["roc_auc_alt"] - out["roc_auc_ref"]
+        out["pr_auc_delta"] = out["pr_auc_alt"] - out["pr_auc_ref"]
+        if roc_delta:
+            out["roc_auc_delta_ci_low"] = float(np.quantile(roc_delta, 0.025))
+            out["roc_auc_delta_ci_high"] = float(np.quantile(roc_delta, 0.975))
+            out["pr_auc_delta_ci_low"] = float(np.quantile(pr_delta, 0.025))
+            out["pr_auc_delta_ci_high"] = float(np.quantile(pr_delta, 0.975))
+        return out
+
+
 class ThresholdSelector:
     """Seleccion de umbral de probabilidad sobre validacion."""
 
