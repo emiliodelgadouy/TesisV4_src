@@ -531,13 +531,23 @@ class ExperimentPlan:
         return pd.DataFrame(rows)
 
     def matrix(self, specs, *, split: str = "val", metric: str = "pr_auc", task=None) -> pd.DataFrame:
-        """Vista backbone × arquitectura de ``metric`` (media entre semillas si hay varias)."""
+        """Vista backbone × arquitectura de ``metric`` (media entre semillas si hay varias).
+
+        Si hay mas de una etiqueta de entrenamiento, las filas son ``(backbone, label)``.
+        """
         table = self.evaluate(specs, split=split, tasks=[self.task if task is None else task])
         if table.empty or metric not in table.columns:
             return pd.DataFrame()
         columns = list(dict.fromkeys(spec.arch for spec in sorted(specs, key=lambda spec: spec.estimated_cost)))
-        rows = list(dict.fromkeys(spec.backbone for spec in specs))
-        pivot = table.pivot_table(index="backbone", columns="arch", values=metric, aggfunc="mean")
+        if len({spec.label_key for spec in specs}) > 1:
+            index = ["backbone", "label"]
+            rows = list(dict.fromkeys((spec.backbone, spec.label_key) for spec in sorted(specs, key=lambda spec: spec.label_key)))
+            rows = sorted(rows, key=lambda row: [spec.backbone for spec in specs].index(row[0]))
+            rows = pd.MultiIndex.from_tuples(rows, names=index)
+        else:
+            index = "backbone"
+            rows = list(dict.fromkeys(spec.backbone for spec in specs))
+        pivot = table.pivot_table(index=index, columns="arch", values=metric, aggfunc="mean")
         return pivot.reindex(index=rows, columns=columns).round(3)
 
     # ------------------------------------------------------------------ decidir
