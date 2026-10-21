@@ -1,53 +1,90 @@
-"""Plan de experimentos por fases: correr, saltear lo hecho, retomar y comparar por validacion.
+"""Plan de experimentos por fases: repetibles (resume, semillas, procedencia) y contrastables.
 
-El estado de cada corrida vive en Comet (``RESUME.BACKEND="comet"``, assets
-``resume_*`` del experimento) o en una carpeta (``"dir"``, ``RESUME.DIR``). Una
-corrida se considera hecha si su estado dice ``done`` o, con
-``RESUME.SKIP_IF_IN_COMET``, si Comet ya tiene una corrida terminada con el
-mismo nombre (desde ``RESUME.COMET_DONE_SINCE``). Una corrida a medias se
-retoma desde la ultima epoca guardada.
+Repetible:
 
-Las decisiones entre fases miran solo validacion (``val_best_metric``, la
-metrica del checkpoint). Test se muestra al final, con ``show_test=True``.
+- El estado de cada corrida vive en Comet (``RESUME.BACKEND="comet"``, assets
+  ``resume_*`` del experimento) o en una carpeta (``"dir"``). Lo terminado se
+  saltea y lo cortado se retoma desde la ultima epoca guardada. Con
+  ``RESUME.SKIP_IF_IN_COMET`` cuenta como hecha una corrida que Comet ya tiene
+  terminada (desde ``RESUME.COMET_DONE_SINCE``).
+- Cada corrida fija sus semillas y loguea commit de ``src``, hash del config,
+  hash de los splits y esquema de etiqueta (``GENERAL.PROVENANCE_*`` / ``LABEL*``).
+
+Contrastable:
+
+- La etiqueta de entrenamiento (``RunSpec.label``, esquemas en
+  ``src.dataset.target.LABEL_SCHEMES``) es un factor; la tarea de evaluacion es
+  fija (``PLAN.TASK``) y siempre sobre las mismas imagenes.
+- ``predictions`` predice el val/test canonico completo con los pesos finales y
+  lo guarda como asset ``predictions_{split}.csv`` del experimento: cualquier
+  par de corridas se compara despues sin reentrenar.
+- ``compare`` decide con bootstrap pareado agrupado por paciente: un candidato
+  pasa si mejora la PR-AUC por mas de ``PLAN.MARGIN`` (ruido entre semillas) y
+  el IC 95 % de la diferencia queda por encima de 0 (ruido de imagenes).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
+import json
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from src.dataset.target import DEFAULT_LABEL, LABEL_SCHEMES, apply_label_scheme, birads_of
 from src.tracking.comet_results import CometRunIndex
 from src.tracking.comet_store import CometRunStore
+from src.training.evaluator import ClinicalMetrics, PairedBootstrap
 from src.training.experiment import TrainingExperiment, resolve_experiment_name
-from src.training.inference import build_trained_model
+from src.training.inference import build_trained_model, predict_dataframe
 from src.training.mode import TrainingMode
-from src.training.resources import RandomSeeds
+from src.training.resources import GpuResources, RandomSeeds
 from src.training.resume import RunStore
 
 DRIVE_ROOT = Path("/content/drive")
 DEFAULT_MARGIN = 0.02
+GROUP_COLUMN = "patient_id"
+PREDICTION_COLUMNS = ("image_id", "patient_id", "study_id", "laterality", "view", "birads")
 
 
 @dataclass(frozen=True)
 class RunSpec:
-    """Una corrida del plan. ``seed=None`` usa ``GENERAL.RANDOM_SEED`` y no agrega sufijo."""
+    """Una corrida del plan.
+
+    ``seed=None`` usa ``GENERAL.RANDOM_SEED``; ``label=None`` usa el esquema
+    ``A``. Ninguno de los dos agrega sufijo al nombre en ese caso.
+    """
 
     mode: str
     backbone: str
     input_size: int | tuple[int, int] | None = None
     seed: int | None = None
     pretrained: RunSpec | None = None
+    label: str | None = None
+
+    @property
+    def label_key(self) -> str:
+        return (self.label or DEFAULT_LABEL).upper()
 
     @property
     def suffix(self) -> str | None:
-        return f"seed{self.seed}" if self.seed is not None else None
+        parts = []
+        if self.label_key != DEFAULT_LABEL:
+            parts.append(f"lbl{self.label_key.lower()}")
+        if self.seed is not None:
+            parts.append(f"seed{self.seed}")
+        return "_".join(parts) or None
 
     def with_seed(self, seed: int | None) -> RunSpec:
         return replace(self, seed=seed)
+
+    def with_label(self, label: str | None) -> RunSpec:
+        return replace(self, label=label)
 
     def name(self, config) -> str:
         name, _ = resolve_experiment_name(
@@ -99,14 +136,34 @@ def prepare_resume(config) -> str | None:
     return target
 
 
+def src_commit() -> str:
+    """Commit de ``src`` (con ``-dirty`` si hay cambios sin commitear)."""
+    src_dir = Path(__file__).resolve().parents[1]
+    try:
+        head = subprocess.run(["git", "-C", str(src_dir), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(src_dir), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return f"{head}-dirty" if dirty else head
+
+
+def _sha1(payload) -> str:
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def _task_scheme(task) -> dict:
+    if isinstance(task, str):
+        return LABEL_SCHEMES[task.upper()]
+    negative, positive = task
+    return {"negative": tuple(negative), "positive": tuple(positive), "drop": (), "title": f"{negative} vs {positive}"}
+
+
 class ExperimentPlan:
-    """Corre ``RunSpec`` salteando lo terminado y retomando lo cortado."""
+    """Corre ``RunSpec`` salteando lo terminado, retomando lo cortado y comparando por pares."""
 
     def __init__(self, config, train_df, val_df, test_df) -> None:
         self.config = config
-        self.train_df = train_df
-        self.val_df = val_df
-        self.test_df = test_df
+        self.frames = {"train": train_df, "val": val_df, "test": test_df}
         resume_cfg = config.get("RESUME") or {}
         self.backend = resume_cfg.get("BACKEND", "comet") if resume_cfg.get("ENABLED", True) else None
         self.resume_dir = resume_cfg.get("DIR") or "runs"
@@ -114,12 +171,64 @@ class ExperimentPlan:
         self.comet = CometRunIndex(config, done_since=resume_cfg.get("COMET_DONE_SINCE"))
         plan_cfg = config.get("PLAN") or {}
         self.margin = float(plan_cfg.get("MARGIN", DEFAULT_MARGIN))
+        self.task = plan_cfg.get("TASK", DEFAULT_LABEL)
+        self.bootstrap_samples = int(plan_cfg.get("BOOTSTRAP_SAMPLES", 1000))
+        self.aliases = dict(plan_cfg.get("ALIASES") or {})
         self.weights_cache = Path(plan_cfg.get("WEIGHTS_CACHE", "checkpoints/comet"))
+        self.predictions_dir = Path(plan_cfg.get("PREDICTIONS_DIR", "predictions"))
         self._stores: dict = {}
         self._summaries: dict[str, dict] = {}
+        self._predictions: dict[tuple[str, str], pd.DataFrame] = {}
+        self.provenance = {
+            "PROVENANCE_SRC_COMMIT": src_commit(),
+            "PROVENANCE_SPLIT_SHA1": self._split_sha1(),
+            "PROVENANCE_CONFIG_SHA1": _sha1({key: value for key, value in config.items() if key != "COMET"}),
+        }
+        if train_df is not None:
+            missing = [name for name, frame in self.frames.items() if "image_id" not in frame.columns]
+            if missing:
+                raise ValueError(f"Los splits {missing} no tienen image_id (hace falta para alinear predicciones)")
+            self.check_splits()
+
+    # ------------------------------------------------------------------ splits
+
+    def _split_sha1(self) -> str | None:
+        if any(frame is None for frame in self.frames.values()):
+            return None
+        return _sha1({name: sorted(frame["image_id"].astype(str)) for name, frame in self.frames.items() if "image_id" in frame.columns})
+
+    def check_splits(self) -> pd.DataFrame:
+        """Falla si un paciente/estudio cae en dos splits; devuelve conteos por esquema."""
+        for column in ("patient_id", "study_id"):
+            if not all(column in frame.columns for frame in self.frames.values()):
+                continue
+            groups = {name: set(frame[column].astype(str)) for name, frame in self.frames.items()}
+            overlaps = {
+                f"{a}∩{b}": len(groups[a] & groups[b])
+                for a, b in (("train", "val"), ("train", "test"), ("val", "test"))
+                if groups[a] & groups[b]
+            }
+            if overlaps:
+                raise ValueError(f"Leakage de {column} entre splits: {overlaps}")
+        rows = []
+        for key, scheme in LABEL_SCHEMES.items():
+            for split, frame in self.frames.items():
+                labeled = apply_label_scheme(frame, scheme)
+                n_pos = int((labeled["cls"] == 1).sum())
+                rows.append({"label": key, "split": split, "n": len(labeled), "n_pos": n_pos, "prevalence": n_pos / max(len(labeled), 1)})
+        counts = pd.DataFrame(rows)
+        print(f"[plan] splits sin leakage; split={self.provenance['PROVENANCE_SPLIT_SHA1']} src={self.provenance['PROVENANCE_SRC_COMMIT']}")
+        return counts
+
+    # ------------------------------------------------------------------ nombres y estado
 
     def name(self, spec: RunSpec) -> str:
         return spec.name(self.config)
+
+    def comet_name(self, spec: RunSpec) -> str:
+        """Nombre en Comet: el canonico o su alias (``PLAN.ALIASES``) para corridas viejas."""
+        name = self.name(spec)
+        return self.aliases.get(name, name)
 
     def _store(self, spec: RunSpec):
         if self.backend is None:
@@ -148,8 +257,8 @@ class ExperimentPlan:
             return "done", {**(state.get("summary") or {}), "source": "resume"}
         if state and state.get("status") in ("training", "trained"):
             return "partial", None
-        if self.skip_if_in_comet:
-            summary = self.comet.finished(self.name(spec))
+        if self.skip_if_in_comet or name != self.comet_name(spec):
+            summary = self.comet.finished(self.comet_name(spec))
             if summary is not None:
                 return "comet", summary
         return "pending", None
@@ -160,7 +269,7 @@ class ExperimentPlan:
             return summary
         if status == "partial":
             return None
-        return self.comet.finished(self.name(spec))
+        return self.comet.finished(self.comet_name(spec))
 
     def show(self, specs) -> pd.DataFrame:
         rows = []
@@ -169,26 +278,42 @@ class ExperimentPlan:
             rows.append(
                 {
                     "experiment": self.name(spec),
+                    "comet_name": self.comet_name(spec),
                     "status": status,
                     "val_best_metric": (summary or {}).get("val_best_metric"),
                 }
             )
         return pd.DataFrame(rows)
 
+    # ------------------------------------------------------------------ correr
+
     def _config_for(self, spec: RunSpec):
         config = copy.deepcopy(self.config)
+        general = config["GENERAL"]
         if spec.seed is not None:
-            config["GENERAL"]["RANDOM_SEED"] = int(spec.seed)
+            general["RANDOM_SEED"] = int(spec.seed)
+        scheme = LABEL_SCHEMES[spec.label_key]
+        general["LABEL"] = spec.label_key
+        general["LABEL_NEGATIVE"] = list(scheme["negative"])
+        general["LABEL_POSITIVE"] = list(scheme["positive"])
+        general["LABEL_DROP"] = list(scheme["drop"])
+        general["EVAL_TASK"] = str(self.task)
+        general.update(self.provenance)
         return config
 
+    def _frames_for(self, spec: RunSpec):
+        scheme = LABEL_SCHEMES[spec.label_key]
+        return tuple(apply_label_scheme(self.frames[split], scheme) for split in ("train", "val", "test"))
+
     def _experiment(self, spec: RunSpec, config, **kwargs) -> TrainingExperiment:
+        train_df, val_df, test_df = self._frames_for(spec)
         return TrainingExperiment(
             config,
             spec.mode,
             spec.backbone,
-            self.train_df,
-            self.val_df,
-            self.test_df,
+            train_df,
+            val_df,
+            test_df,
             experiment_suffix=spec.suffix,
             input_size=spec.input_size,
             resume_store=self._store(spec),
@@ -252,20 +377,158 @@ class ExperimentPlan:
         )
 
     def _final_weights(self, spec: RunSpec, status: str) -> Path:
-        name = self.name(spec)
         store = self._store(spec)
         if status == "done" and isinstance(store, RunStore):
             state = store.load() or {}
             for entry in state.get("best_checkpoints", []):
                 if store.has_file(entry.get("file")):
                     return store.path(entry["file"])
-        return self.comet.download_final_weights(name, self.weights_cache)
+        return self.comet.download_final_weights(self.comet_name(spec), self.weights_cache)
 
     def final_weights(self, spec: RunSpec) -> Path:
         status, _ = self.status(spec)
         if status in ("pending", "partial"):
             raise FileNotFoundError(f"{self.name(spec)} todavia no termino")
         return self._final_weights(spec, status)
+
+    # ------------------------------------------------------------------ predicciones
+
+    def _inference_model(self, spec: RunSpec):
+        config = self._config_for(spec)
+        weights = self.final_weights(spec)
+        pretrained = self.trained_builder(spec.pretrained) if spec.pretrained is not None else None
+        return build_trained_model(config, spec.mode, spec.backbone, weights, input_size=spec.input_size, pretrained_builder=pretrained)
+
+    def predictions(self, spec: RunSpec, split: str = "val") -> pd.DataFrame:
+        """Probabilidades del split canonico completo (todos los BI-RADS), alineadas por ``image_id``.
+
+        Se cachean como asset ``predictions_{split}.csv`` del experimento en Comet.
+        """
+        key = (self.name(spec), split)
+        if key in self._predictions:
+            return self._predictions[key]
+        summary = self.lookup(spec)
+        if summary is None:
+            raise FileNotFoundError(f"{self.name(spec)} todavia no termino")
+        frame = self.frames[split]
+        asset_name = f"predictions_{split}.csv"
+        api_exp = self.comet.api.get_experiment_by_key(summary["comet_key"]) if summary.get("comet_key") else None
+        cached = None
+        if api_exp is not None:
+            assets = [asset for asset in api_exp.get_asset_list() or [] if asset.get("fileName") == asset_name]
+            if assets:
+                newest = max(assets, key=lambda asset: int(asset.get("createdAt") or 0))
+                cached = pd.read_csv(io.BytesIO(api_exp.get_asset(newest["assetId"], return_type="binary")), dtype={"image_id": str})
+                if set(cached["image_id"]) != set(frame["image_id"].astype(str)):
+                    print(f"[plan] {asset_name} de {self.comet_name(spec)} no coincide con el split actual; recalculo")
+                    cached = None
+        if cached is None:
+            print(f"[plan] {self.name(spec)}: predigo {split} completo ({len(frame)} imagenes)")
+            model = self._inference_model(spec)
+            try:
+                y_prob = predict_dataframe(self._config_for(spec), model, frame, mode=spec.mode, backbone_name=spec.backbone)
+            finally:
+                GpuResources.dispose_model_builder(model)
+                GpuResources.release(clear_keras_session=True)
+            cached = frame[[column for column in PREDICTION_COLUMNS if column in frame.columns and column != "birads"]].copy()
+            cached["image_id"] = cached["image_id"].astype(str)
+            cached["birads"] = birads_of(frame).to_numpy()
+            cached["y_prob"] = y_prob
+            self.predictions_dir.mkdir(parents=True, exist_ok=True)
+            path = self.predictions_dir / f"{self.name(spec)}_{asset_name}"
+            cached.to_csv(path, index=False)
+            if api_exp is not None:
+                api_exp.log_asset(str(path), name=asset_name)
+        order = frame["image_id"].astype(str).to_numpy()
+        cached = cached.drop_duplicates("image_id").set_index("image_id").loc[order].reset_index()
+        self._predictions[key] = cached
+        return cached
+
+    def _task_arrays(self, predictions: pd.DataFrame, task):
+        scheme = _task_scheme(task)
+        birads = predictions["birads"].to_numpy()
+        mask = np.isin(birads, list(scheme["negative"]) + list(scheme["positive"]))
+        y = np.isin(birads[mask], list(scheme["positive"])).astype(int)
+        groups = predictions[GROUP_COLUMN].astype(str).to_numpy()[mask] if GROUP_COLUMN in predictions.columns else None
+        return mask, y, groups
+
+    def evaluate(self, specs, *, split: str = "val", tasks=None) -> pd.DataFrame:
+        """Metricas clinicas de cada corrida sobre las mismas imagenes, por tarea."""
+        tasks = list(tasks) if tasks is not None else [self.task]
+        rows = []
+        for spec in specs:
+            predictions = self.predictions(spec, split)
+            for task in tasks:
+                mask, y, _ = self._task_arrays(predictions, task)
+                metrics = ClinicalMetrics.compute(y, predictions["y_prob"].to_numpy()[mask])
+                rows.append({"experiment": self.name(spec), "split": split, "task": _task_scheme(task)["title"], **metrics})
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------ decidir
+
+    def compare(self, reference: RunSpec, candidates, *, split: str = "val", task=None, margin: float | None = None):
+        """Candidatos vs referencia sobre las mismas imagenes de ``split`` y la tarea ``task``.
+
+        Pasa un candidato si ``Δ PR-AUC > margin`` y el IC 95 % pareado (bootstrap
+        agrupado por paciente) queda por encima de 0. Gana el mejor que pasa; si
+        ninguno, la referencia. Devuelve ``(tabla, ganador)``.
+        """
+        task = self.task if task is None else task
+        margin = self.margin if margin is None else float(margin)
+        ref_predictions = self.predictions(reference, split)
+        mask, y, groups = self._task_arrays(ref_predictions, task)
+        ref_prob = ref_predictions["y_prob"].to_numpy()[mask]
+        ref_metrics = ClinicalMetrics.compute(y, ref_prob)
+        rows = [{"experiment": self.name(reference), "role": "referencia", **ref_metrics, "pasa": None}]
+        winner, winner_value = reference, ref_metrics.get("pr_auc", float("-inf"))
+        for spec in candidates:
+            if self.lookup(spec) is None:
+                rows.append({"experiment": self.name(spec), "role": "candidato", "pasa": None})
+                continue
+            prob = self.predictions(spec, split)["y_prob"].to_numpy()[mask]
+            delta = PairedBootstrap.auc_delta(
+                y, ref_prob, prob, groups=groups, samples=self.bootstrap_samples, seed=int(self.config["GENERAL"]["RANDOM_SEED"])
+            )
+            metrics = ClinicalMetrics.compute(y, prob)
+            passes = bool(delta["pr_auc_delta"] > margin and delta.get("pr_auc_delta_ci_low", float("-inf")) > 0)
+            rows.append(
+                {
+                    "experiment": self.name(spec),
+                    "role": "candidato",
+                    **metrics,
+                    "pr_auc_delta": delta["pr_auc_delta"],
+                    "pr_auc_delta_ci_low": delta.get("pr_auc_delta_ci_low"),
+                    "pr_auc_delta_ci_high": delta.get("pr_auc_delta_ci_high"),
+                    "roc_auc_delta": delta["roc_auc_delta"],
+                    "roc_auc_delta_ci_low": delta.get("roc_auc_delta_ci_low"),
+                    "roc_auc_delta_ci_high": delta.get("roc_auc_delta_ci_high"),
+                    "pasa": passes,
+                }
+            )
+            if passes and metrics["pr_auc"] > winner_value:
+                winner, winner_value = spec, metrics["pr_auc"]
+        table = pd.DataFrame(rows)
+        missing = table.loc[table["pasa"].isna() & (table["role"] == "candidato"), "experiment"].tolist()
+        if missing:
+            print(f"[plan] sin resultado todavia: {missing}")
+        title = _task_scheme(task)["title"]
+        print(f"[plan] {split}, tarea {title}, margen {margin:.3f} + IC pareado > 0 → gana {self.name(winner)} (PR-AUC {winner_value:.4f})")
+        return table, winner
+
+    def top(self, specs, k: int = 2, *, split: str = "val", task=None) -> list[RunSpec]:
+        """Los ``k`` mejores por PR-AUC sobre las mismas imagenes."""
+        task = self.task if task is None else task
+        scored = []
+        for spec in specs:
+            if self.lookup(spec) is None:
+                continue
+            predictions = self.predictions(spec, split)
+            mask, y, _ = self._task_arrays(predictions, task)
+            scored.append((ClinicalMetrics.compute(y, predictions["y_prob"].to_numpy()[mask])["pr_auc"], spec))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [spec for _, spec in scored[:k]]
+
+    # ------------------------------------------------------------------ reportes
 
     def table(self, specs, *, show_test: bool = False) -> pd.DataFrame:
         rows = []
@@ -275,9 +538,9 @@ class ExperimentPlan:
                 "experiment": self.name(spec),
                 "mode": TrainingMode.parse(spec.mode),
                 "backbone": spec.backbone,
+                "label": spec.label_key,
                 "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
                 "val_best_metric": summary.get("val_best_metric"),
-                "val_roc_auc": summary.get("val_roc_auc"),
                 "source": summary.get("source"),
                 "comet_url": summary.get("comet_url"),
             }
@@ -287,55 +550,15 @@ class ExperimentPlan:
             rows.append(row)
         return pd.DataFrame(rows)
 
-    def compare(self, reference: RunSpec, candidates, *, margin: float | None = None):
-        """Candidatos vs referencia por ``val_best_metric``.
-
-        Pasa un candidato si supera a la referencia por mas de ``margin`` (ruido
-        entre repeticiones). Gana el mejor que pasa; si ninguno, la referencia.
-        Devuelve ``(tabla, ganador)``.
-        """
-        margin = self.margin if margin is None else float(margin)
-        ref_summary = self.lookup(reference)
-        if ref_summary is None or ref_summary.get("val_best_metric") is None:
-            raise RuntimeError(f"La referencia {self.name(reference)} no tiene val_best_metric")
-        ref_value = float(ref_summary["val_best_metric"])
-        rows = [{"experiment": self.name(reference), "role": "referencia", "val_best_metric": ref_value, "delta": 0.0, "pasa": None}]
-        winner, winner_value = reference, ref_value
-        for spec in candidates:
-            summary = self.lookup(spec) or {}
-            value = summary.get("val_best_metric")
-            if value is None:
-                rows.append({"experiment": self.name(spec), "role": "candidato", "val_best_metric": None, "delta": None, "pasa": None})
-                continue
-            delta = float(value) - ref_value
-            passes = delta > margin
-            rows.append({"experiment": self.name(spec), "role": "candidato", "val_best_metric": float(value), "delta": delta, "pasa": passes})
-            if passes and float(value) > winner_value:
-                winner, winner_value = spec, float(value)
-        table = pd.DataFrame(rows)
-        missing = table.loc[table["val_best_metric"].isna(), "experiment"].tolist()
-        if missing:
-            print(f"[plan] sin resultado todavia: {missing}")
-        print(f"[plan] margen {margin:.3f} → gana {self.name(winner)} (val {winner_value:.4f})")
-        return table, winner
-
-    def top(self, specs, k: int = 2) -> list[RunSpec]:
-        scored = []
-        for spec in specs:
-            value = (self.lookup(spec) or {}).get("val_best_metric")
-            if value is not None:
-                scored.append((float(value), spec))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [spec for _, spec in scored[:k]]
-
-    def seed_summary(self, groups: dict) -> pd.DataFrame:
-        """Media ± desvio por configuracion: ``{"etiqueta": [RunSpec por semilla, ...]}``."""
+    def seed_summary(self, groups: dict, *, split: str = "test", task=None) -> pd.DataFrame:
+        """Media ± desvio entre semillas de las metricas clinicas: ``{"config": [RunSpec, ...]}``."""
         rows = []
         for label, specs in groups.items():
-            table = self.table(specs, show_test=True)
-            row = {"config": label, "n": int(table["val_best_metric"].notna().sum())}
-            for column in ("val_best_metric", "test_roc_auc", "test_pr_auc"):
-                values = pd.to_numeric(table[column], errors="coerce").dropna().to_numpy()
+            done = [spec for spec in specs if self.lookup(spec) is not None]
+            metrics = self.evaluate(done, split=split, tasks=[self.task if task is None else task]) if done else pd.DataFrame()
+            row = {"config": label, "n_seeds": len(done), "split": split}
+            for column in ("roc_auc", "pr_auc", "pr_auc_over_baseline", "sens_at_spec_90", "sens_at_spec_95", "prec_at_recall_80"):
+                values = pd.to_numeric(metrics.get(column, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy()
                 row[f"{column}_mean"] = float(np.mean(values)) if len(values) else None
                 row[f"{column}_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else None
             rows.append(row)

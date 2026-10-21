@@ -39,10 +39,20 @@ con `PATCH_HARDNEG.ALIGN_TO_BAG_GRID=True`.
 
 El driver de `multirun.ipynb` es un plan por fases (`training/plan.py`):
 `ExperimentPlan` corre una lista de `RunSpec(mode, backbone, input_size, seed,
-pretrained)`, saltea lo terminado y compara contra una referencia por
-`val_best_metric` con el margen `PLAN.MARGIN`. `METRIC_TO_MAXIMIZE=pr_auc` y
+pretrained, label)` y saltea lo terminado. `METRIC_TO_MAXIMIZE=pr_auc` y
 `USE_CUSTOM_BATCH_SIZE=True`. Los bucles de barrido completo por modo quedan
 comentados y también pasan por `plan.run`.
+
+- `label`: esquema de `dataset/target.py::LABEL_SCHEMES` (A 1–2 vs 3–5, B sin
+  BI-RADS 3, C con 3 negativo). Sufijo `_lbl{x}` en el nombre salvo A.
+- `predictions(spec, split)`: predice el split canónico completo con los
+  pesos finales y lo cachea como asset `predictions_{split}.csv` en Comet.
+- `compare`, `evaluate`, `top`, `seed_summary`: siempre sobre las mismas
+  imágenes y la tarea `PLAN.TASK`, con `ClinicalMetrics` y
+  `PairedBootstrap` (agrupado por `patient_id`).
+- `PLAN.ALIASES` mapea nombres canónicos a corridas viejas de Comet.
+- Cada corrida loguea `LABEL*`, `EVAL_TASK` y `PROVENANCE_*` (commit de `src`,
+  hash de splits y de config); el plan falla si hay leakage de paciente.
 
 ## Resume
 

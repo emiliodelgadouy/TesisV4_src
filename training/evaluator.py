@@ -65,6 +65,42 @@ class Predictor:
         return y_true, y_prob
 
 
+class ClinicalMetrics:
+    """Metricas independientes del umbral para comparar modelos sobre las mismas imagenes."""
+
+    @staticmethod
+    def compute(y_true, y_prob) -> dict[str, float]:
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_prob = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+        n_pos = int((y_true == 1).sum())
+        n_neg = int((y_true == 0).sum())
+        out = {"n_pos": n_pos, "n_neg": n_neg, "prevalence": n_pos / max(n_pos + n_neg, 1)}
+        if n_pos == 0 or n_neg == 0:
+            return out
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
+        precision, recall, _ = precision_recall_curve(y_true, y_prob)
+        pr_auc = float(average_precision_score(y_true, y_prob))
+
+        def sens_at_spec(target: float) -> float:
+            ok = (1.0 - fpr) >= target
+            return float(tpr[ok].max()) if ok.any() else float("nan")
+
+        ok_recall = recall >= 0.80
+        out.update(
+            {
+                "roc_auc": float(roc_auc_score(y_true, y_prob)),
+                "pr_auc": pr_auc,
+                "pr_auc_over_baseline": pr_auc / out["prevalence"],
+                "sens_at_spec_90": sens_at_spec(0.90),
+                "sens_at_spec_95": sens_at_spec(0.95),
+                "prec_at_recall_80": float(precision[ok_recall].max()) if ok_recall.any() else float("nan"),
+            }
+        )
+        return out
+
+
 class PairedBootstrap:
     """Comparacion de dos modelos sobre las mismas imagenes (bootstrap pareado)."""
 

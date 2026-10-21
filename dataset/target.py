@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+import numpy as np
 import pandas as pd
 
 TARGET_BIRADS = "birads"
@@ -22,6 +23,36 @@ def parse_breast_birads(values: pd.Series) -> pd.Series:
     digits = values.astype("string").str.extract(r"(\d)", expand=False)
     parsed = pd.to_numeric(digits, errors="coerce")
     return parsed.where(parsed.isin(list(BIRADS_VALID)))
+
+
+# Esquemas binarios sobre BI-RADS. "A" es el objetivo clinico del proyecto; las
+# corridas con otro esquema llevan sufijo ``_lbl{clave}`` en el nombre.
+LABEL_SCHEMES = {
+    "A": {"negative": (1, 2), "positive": (3, 4, 5), "drop": (), "title": "1-2 vs 3-5"},
+    "B": {"negative": (1, 2), "positive": (4, 5), "drop": (3,), "title": "1-2 vs 4-5 (sin BI-RADS 3)"},
+    "C": {"negative": (1, 2, 3), "positive": (4, 5), "drop": (), "title": "1-3 vs 4-5"},
+}
+DEFAULT_LABEL = "A"
+
+
+def birads_of(df: pd.DataFrame) -> pd.Series:
+    """BI-RADS 1-5 de cada fila (columna ``birads`` o parseo de ``breast_birads``)."""
+    if "birads" in df.columns:
+        return pd.to_numeric(df["birads"], errors="coerce")
+    return parse_breast_birads(df[BIRADS_COLUMN])
+
+
+def apply_label_scheme(df: pd.DataFrame, scheme: Mapping) -> pd.DataFrame:
+    """Reetiqueta ``cls`` segun ``scheme`` y descarta ``drop`` y lo que no cae en ninguna clase."""
+    out = df.copy()
+    out["birads"] = birads_of(out)
+    if scheme.get("drop"):
+        out = out.loc[~out["birads"].isin(list(scheme["drop"]))]
+    cls = pd.Series(np.nan, index=out.index, dtype="float32")
+    cls = cls.mask(out["birads"].isin(list(scheme["negative"])), 0.0)
+    cls = cls.mask(out["birads"].isin(list(scheme["positive"])), 1.0)
+    out = out.assign(cls=cls.astype("float32"))
+    return out.loc[out["cls"].notna()].reset_index(drop=True)
 
 
 def cls_from_birads(values: pd.Series) -> pd.Series:
