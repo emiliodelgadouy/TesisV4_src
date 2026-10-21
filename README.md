@@ -37,9 +37,12 @@ con `PATCH_HARDNEG.ALIGN_TO_BAG_GRID=True`.
 
 ## Contrato del notebook
 
-El driver de `multirun.ipynb` es un plan por fases (`training/plan.py`):
+El driver de `multirun.ipynb` es una matriz anclada (`training/plan.py`):
 `ExperimentPlan` corre una lista de `RunSpec(mode, backbone, input_size, seed,
-pretrained, label)` y saltea lo terminado. `METRIC_TO_MAXIMIZE=pr_auc` y
+pretrained, label)` y saltea lo terminado. El notebook arma un corte por
+pregunta de tesis (`PREGUNTAS`) alrededor de `resized_672_swint` y
+`resized_672_efficientnetb0`, y entrena su unión sin duplicados en el proyecto
+de Comet `tesis_v4`. `METRIC_TO_MAXIMIZE=pr_auc` y
 `USE_CUSTOM_BATCH_SIZE=True`. Los bucles de barrido completo por modo quedan
 comentados y también pasan por `plan.run`.
 
@@ -50,9 +53,16 @@ comentados y también pasan por `plan.run`.
 - `compare`, `evaluate`, `top`, `seed_summary`: siempre sobre las mismas
   imágenes y la tarea `PLAN.TASK`, con `ClinicalMetrics` y
   `PairedBootstrap` (agrupado por `patient_id`).
-- `PLAN.ALIASES` mapea nombres canónicos a corridas viejas de Comet.
+- `pairwise`: todas contra todas, con diferencia e IC 95 % por par, sin elegir.
+- `unique(specs)`: deduplica por nombre conservando el orden; `by_cost` ordena
+  de lo más barato a lo más caro.
+- `timing(specs)`: horas reales (`training_wall_seconds`) frente al costo
+  estimado, y reestimación de lo que falta.
+- `PLAN.ALIASES` mapea nombres canónicos a corridas viejas de Comet (no se usa
+  en `tesis_v4`).
 - Cada corrida loguea `LABEL*`, `EVAL_TASK` y `PROVENANCE_*` (commit de `src`,
-  hash de splits y de config); el plan falla si hay leakage de paciente.
+  hash de splits y de config, versiones de Python/TF/Keras/comet_ml y GPU); el
+  plan falla si hay leakage de paciente.
 
 ## Resume
 
@@ -73,9 +83,9 @@ Si la sesión se corta, volver a correr el notebook:
 - `training` / `trained`: se saltean las etapas completas, la etapa a medias
   sigue desde la última época (`initial_epoch`) y el log sigue en el mismo
   experimento de Comet (`experiment_key` + `mode="get"`).
-- Con `RESUME.SKIP_IF_IN_COMET`, una corrida terminada en Comet desde
-  `RESUME.COMET_DONE_SINCE` cuenta como hecha; sus pesos se bajan de Comet si
-  hace falta transferirlos.
+- Con `RESUME.SKIP_IF_IN_COMET`, una corrida terminada en Comet con el mismo
+  nombre cuenta como hecha (opcionalmente solo desde `RESUME.COMET_DONE_SINCE`);
+  sus pesos se bajan de Comet si hace falta transferirlos.
 
 Se restauran pesos, learning rate y contadores de EarlyStopping y
 ReduceLROnPlateau; los momentos de Adam no.
@@ -101,7 +111,7 @@ rendimiento de mamografía completa sale de `standard`, `resized` y los modos AB
 
 ## Estado
 
-El dump de Comet del 2026-09-07 (`simple` / `full`, checkpoint `auc`,
-EfficientNet-B0, CheXNet y VGG19) es anterior a este contrato. El estado de
-esas corridas y de lo que falta entrenar está en el README del workspace
+Las corridas de `tesis_v3` (incluido el dump de Comet del 2026-09-07 con
+`simple` / `full` y checkpoint `auc`) son anteriores a la matriz anclada. La
+tabla de cortes y lo que falta entrenar están en el README del workspace
 `TesisV4`.

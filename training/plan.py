@@ -8,7 +8,10 @@ Repetible:
   ``RESUME.SKIP_IF_IN_COMET`` cuenta como hecha una corrida que Comet ya tiene
   terminada (desde ``RESUME.COMET_DONE_SINCE``).
 - Cada corrida fija sus semillas y loguea commit de ``src``, hash del config,
-  hash de los splits y esquema de etiqueta (``GENERAL.PROVENANCE_*`` / ``LABEL*``).
+  hash de los splits, versiones de Python/TF/Keras/comet_ml, GPU y esquema de
+  etiqueta (``GENERAL.PROVENANCE_*`` / ``LABEL*``).
+- ``unique`` deduplica celdas compartidas entre cortes; ``timing`` compara horas
+  reales con el costo estimado.
 
 Contrastable:
 
@@ -169,6 +172,31 @@ def src_commit() -> str:
     return f"{head}-dirty" if dirty else head
 
 
+def environment() -> dict[str, str]:
+    """Versiones y GPU del entorno. En Colab no se instalan los requirements: la
+    version de TensorFlow la decide Colab, asi que se registra por corrida."""
+    import platform
+
+    import comet_ml
+    import keras
+    import tensorflow as tf
+
+    gpus = tf.config.list_physical_devices("GPU")
+    gpu_names = []
+    for gpu in gpus:
+        try:
+            gpu_names.append(str(tf.config.experimental.get_device_details(gpu).get("device_name") or gpu.name))
+        except Exception:
+            gpu_names.append(gpu.name)
+    return {
+        "PROVENANCE_PYTHON": platform.python_version(),
+        "PROVENANCE_TENSORFLOW": tf.__version__,
+        "PROVENANCE_KERAS": keras.__version__,
+        "PROVENANCE_COMET_ML": comet_ml.__version__,
+        "PROVENANCE_GPU": ", ".join(gpu_names) or "cpu",
+    }
+
+
 def _sha1(payload) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
 
@@ -206,6 +234,7 @@ class ExperimentPlan:
             "PROVENANCE_SRC_COMMIT": src_commit(),
             "PROVENANCE_SPLIT_SHA1": self._split_sha1(),
             "PROVENANCE_CONFIG_SHA1": _sha1({key: value for key, value in config.items() if key != "COMET"}),
+            **environment(),
         }
         if train_df is not None:
             missing = [name for name, frame in self.frames.items() if "image_id" not in frame.columns]
@@ -396,6 +425,49 @@ class ExperimentPlan:
     def by_cost(specs) -> list[RunSpec]:
         """Lo mas barato primero (la matriz se llena rapido; lo caro queda al final)."""
         return sorted(specs, key=lambda spec: spec.estimated_cost)
+
+    def unique(self, specs) -> list[RunSpec]:
+        """Sin duplicados por nombre de experimento, conservando el orden: una celda
+        compartida por dos cortes se entrena una sola vez."""
+        seen: dict[str, RunSpec] = {}
+        for spec in specs:
+            seen.setdefault(self.name(spec), spec)
+        return list(seen.values())
+
+    def timing(self, specs, *, hours_per_cost: float | None = None) -> pd.DataFrame:
+        """Horas reales de entrenamiento (``training_wall_seconds``) vs el costo estimado.
+
+        ``h_per_cost`` sirve para recalibrar la estimacion de lo que falta; las
+        pendientes quedan con ``hours`` vacio y ``estimated_hours`` segun la mediana
+        de ``h_per_cost`` de las terminadas (o ``hours_per_cost`` si se pasa).
+        """
+        rows = []
+        for spec in specs:
+            summary = self.lookup(spec) or {}
+            seconds = summary.get("training_wall_seconds")
+            hours = float(seconds) / 3600 if seconds is not None else None
+            cost = spec.estimated_cost
+            rows.append(
+                {
+                    "experiment": self.name(spec),
+                    "backbone": spec.backbone,
+                    "arch": spec.arch,
+                    "cost": round(cost, 1),
+                    "hours": hours,
+                    "h_per_cost": hours / cost if hours is not None else None,
+                }
+            )
+        table = pd.DataFrame(rows)
+        if table.empty:
+            return table
+        table[["hours", "h_per_cost"]] = table[["hours", "h_per_cost"]].apply(pd.to_numeric, errors="coerce")
+        measured = table["h_per_cost"].dropna()
+        rate = hours_per_cost if hours_per_cost is not None else (float(measured.median()) if len(measured) else None)
+        table["estimated_hours"] = table["hours"].fillna(table["cost"] * rate) if rate is not None else table["hours"]
+        done_hours = table["hours"].sum()
+        remaining = table.loc[table["hours"].isna(), "estimated_hours"].sum()
+        print(f"[plan] {int(table['hours'].notna().sum())}/{len(table)} con tiempo: {done_hours:.1f} h hechas, ~{remaining:.1f} h estimadas para el resto" + (f" ({rate:.3f} h por unidad de costo)" if rate is not None else ""))
+        return table.round(3)
 
     def trained_builder(self, spec: RunSpec):
         """Builder entrenado de ``spec`` (para transferir): entrena si falta, si no carga pesos."""
