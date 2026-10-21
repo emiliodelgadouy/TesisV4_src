@@ -356,6 +356,9 @@ class TrainingExperiment:
             y_test_true, y_test_prob = Predictor.predict_probs_and_labels(model, ds_test)
 
             evaluation_cfg = config.get("EVALUATION") or {}
+            if evaluation_cfg.get("LOG_PREDICTIONS", True):
+                self._log_predictions(experiment, "val", val_df, y_val_prob)
+                self._log_predictions(experiment, "test", test_df, y_test_prob)
             prediction_paths = {}
             if evaluation_cfg.get("EXPORT_PREDICTIONS", False):
                 prediction_paths["train"] = self._export_predictions(
@@ -536,6 +539,16 @@ class TrainingExperiment:
             "test_pr_auc_ci_low": float(np.quantile(pr_values, 0.025)),
             "test_pr_auc_ci_high": float(np.quantile(pr_values, 0.975)),
         }
+
+    @staticmethod
+    def _log_predictions(experiment, split_name: str, table, y_prob) -> None:
+        """Sube ``predictions_{split}.csv`` (ids + probabilidad) para comparar corridas sin reentrenar."""
+        if "image_id" not in table.columns or len(table) != len(y_prob):
+            return
+        columns = [column for column in ("image_id", "patient_id", "study_id", "laterality", "view", "birads") if column in table.columns]
+        frame = table[columns].reset_index(drop=True).copy()
+        frame["y_prob"] = np.asarray(y_prob, dtype=np.float64)
+        experiment.log_asset_data(frame.to_csv(index=False), name=f"predictions_{split_name}.csv", overwrite=True)
 
     @staticmethod
     def _export_predictions(

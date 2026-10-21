@@ -43,7 +43,7 @@ from src.tracking.comet_store import CometRunStore
 from src.training.evaluator import ClinicalMetrics, PairedBootstrap
 from src.training.experiment import TrainingExperiment, resolve_experiment_name
 from src.training.inference import build_trained_model, predict_dataframe
-from src.training.mode import TrainingMode
+from src.training.mode import TrainingMode, normalize_input_size, resized_size_label
 from src.training.resources import GpuResources, RandomSeeds
 from src.training.resume import RunStore
 
@@ -86,6 +86,27 @@ class RunSpec:
 
     def with_label(self, label: str | None) -> RunSpec:
         return replace(self, label=label)
+
+    @property
+    def arch(self) -> str:
+        """Arquitectura para tablas: ``standard``, ``resized_672``, ``abmil``, ..."""
+        mode = TrainingMode.parse(self.mode)
+        if mode == TrainingMode.RESIZED and self.input_size is not None:
+            return f"resized_{resized_size_label(self.input_size)}"
+        return str(mode)
+
+    @property
+    def estimated_cost(self) -> float:
+        """Costo relativo a ``standard`` a 224 (pixeles procesados por imagen)."""
+        mode = TrainingMode.parse(self.mode)
+        if mode == TrainingMode.RESIZED:
+            height, width = normalize_input_size(self.input_size or 672)
+            return height * width / (224 * 224)
+        if mode == TrainingMode.ABMIL:
+            return 9.0
+        if mode == TrainingMode.ABMIL_PATCH_HARDNEG:
+            return 10.0
+        return 1.0
 
     def name(self, config) -> str:
         name, _ = resolve_experiment_name(
@@ -180,6 +201,7 @@ class ExperimentPlan:
         self._stores: dict = {}
         self._summaries: dict[str, dict] = {}
         self._predictions: dict[tuple[str, str], pd.DataFrame] = {}
+        self.failures: dict[str, str] = {}
         self.provenance = {
             "PROVENANCE_SRC_COMMIT": src_commit(),
             "PROVENANCE_SPLIT_SHA1": self._split_sha1(),
@@ -276,11 +298,17 @@ class ExperimentPlan:
         rows = []
         for spec in specs:
             status, summary = self.status(spec)
+            name = self.name(spec)
+            if status == "pending" and name in self.failures:
+                status = "failed"
             rows.append(
                 {
-                    "experiment": self.name(spec),
+                    "experiment": name,
+                    "backbone": spec.backbone,
+                    "arch": spec.arch,
                     "comet_name": self.comet_name(spec),
                     "status": status,
+                    "cost": round(spec.estimated_cost, 1),
                     "val_best_metric": (summary or {}).get("val_best_metric"),
                 }
             )
@@ -346,10 +374,28 @@ class ExperimentPlan:
         self._remember(name, experiment.summary)
         return self._summaries.get(name, {})
 
-    def run_all(self, specs) -> pd.DataFrame:
+    def run_all(self, specs, *, continue_on_error: bool = False) -> pd.DataFrame:
+        """Corre en orden. Con ``continue_on_error`` un fallo (p. ej. OOM) se anota en
+        ``failures`` y se sigue con la siguiente; al volver a correr se reintenta."""
         for spec in specs:
-            self.run(spec)
+            name = self.name(spec)
+            try:
+                self.run(spec)
+                self.failures.pop(name, None)
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+                self.failures[name] = f"{type(exc).__name__}: {exc}"
+                print(f"[plan] {name}: FALLO, sigo con la siguiente ({self.failures[name][:300]})")
+        failed = [self.name(spec) for spec in specs if self.name(spec) in self.failures]
+        if failed:
+            print(f"[plan] {len(failed)} corridas fallaron en esta sesion: {failed}")
         return self.table(specs)
+
+    @staticmethod
+    def by_cost(specs) -> list[RunSpec]:
+        """Lo mas barato primero (la matriz se llena rapido; lo caro queda al final)."""
+        return sorted(specs, key=lambda spec: spec.estimated_cost)
 
     def trained_builder(self, spec: RunSpec):
         """Builder entrenado de ``spec`` (para transferir): entrena si falta, si no carga pesos."""
@@ -420,6 +466,9 @@ class ExperimentPlan:
             if assets:
                 newest = max(assets, key=lambda asset: int(asset.get("createdAt") or 0))
                 cached = pd.read_csv(io.BytesIO(api_exp.get_asset(newest["assetId"], return_type="binary")), dtype={"image_id": str})
+                if "birads" not in cached.columns:
+                    birads_by_image = pd.Series(birads_of(frame).to_numpy(), index=frame["image_id"].astype(str))
+                    cached["birads"] = cached["image_id"].map(birads_by_image)
                 if set(cached["image_id"]) != set(frame["image_id"].astype(str)):
                     print(f"[plan] {asset_name} de {self.comet_name(spec)} no coincide con el split actual; recalculo")
                     cached = None
@@ -467,8 +516,29 @@ class ExperimentPlan:
             for task in tasks:
                 mask, y, _ = self._task_arrays(predictions, task)
                 metrics = ClinicalMetrics.compute(y, predictions["y_prob"].to_numpy()[mask])
-                rows.append({"experiment": self.name(spec), "split": split, "task": _task_scheme(task)["title"], **metrics})
+                rows.append(
+                    {
+                        "experiment": self.name(spec),
+                        "backbone": spec.backbone,
+                        "arch": spec.arch,
+                        "label": spec.label_key,
+                        "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
+                        "split": split,
+                        "task": _task_scheme(task)["title"],
+                        **metrics,
+                    }
+                )
         return pd.DataFrame(rows)
+
+    def matrix(self, specs, *, split: str = "val", metric: str = "pr_auc", task=None) -> pd.DataFrame:
+        """Vista backbone × arquitectura de ``metric`` (media entre semillas si hay varias)."""
+        table = self.evaluate(specs, split=split, tasks=[self.task if task is None else task])
+        if table.empty or metric not in table.columns:
+            return pd.DataFrame()
+        columns = list(dict.fromkeys(spec.arch for spec in sorted(specs, key=lambda spec: spec.estimated_cost)))
+        rows = list(dict.fromkeys(spec.backbone for spec in specs))
+        pivot = table.pivot_table(index="backbone", columns="arch", values=metric, aggfunc="mean")
+        return pivot.reindex(index=rows, columns=columns).round(3)
 
     # ------------------------------------------------------------------ decidir
 
