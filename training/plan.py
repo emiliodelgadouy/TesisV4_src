@@ -18,9 +18,10 @@ Contrastable:
 - ``predictions`` predice el val/test canonico completo con los pesos finales y
   lo guarda como asset ``predictions_{split}.csv`` del experimento: cualquier
   par de corridas se compara despues sin reentrenar.
-- ``compare`` decide con bootstrap pareado agrupado por paciente: un candidato
-  pasa si mejora la PR-AUC por mas de ``PLAN.MARGIN`` (ruido entre semillas) y
-  el IC 95 % de la diferencia queda por encima de 0 (ruido de imagenes).
+- ``evaluate`` y ``pairwise`` reportan metricas clinicas y diferencias de todos
+  los pares con IC 95 % (bootstrap pareado agrupado por paciente), sin elegir.
+- ``compare`` / ``top`` si eligen: un candidato pasa si mejora la PR-AUC por
+  mas de ``PLAN.MARGIN`` y el IC 95 % de la diferencia queda por encima de 0.
 """
 
 from __future__ import annotations
@@ -455,8 +456,13 @@ class ExperimentPlan:
     def evaluate(self, specs, *, split: str = "val", tasks=None) -> pd.DataFrame:
         """Metricas clinicas de cada corrida sobre las mismas imagenes, por tarea."""
         tasks = list(tasks) if tasks is not None else [self.task]
+        pending = [self.name(spec) for spec in specs if self.lookup(spec) is None]
+        if pending:
+            print(f"[plan] sin resultado todavia: {pending}")
         rows = []
         for spec in specs:
+            if self.name(spec) in pending:
+                continue
             predictions = self.predictions(spec, split)
             for task in tasks:
                 mask, y, _ = self._task_arrays(predictions, task)
@@ -515,6 +521,46 @@ class ExperimentPlan:
         print(f"[plan] {split}, tarea {title}, margen {margin:.3f} + IC pareado > 0 → gana {self.name(winner)} (PR-AUC {winner_value:.4f})")
         return table, winner
 
+    def pairwise(self, specs, *, split: str = "val", task=None) -> pd.DataFrame:
+        """Todas contra todas sobre las mismas imagenes, sin elegir ganador.
+
+        Una fila por par ``(a, b)``: metricas de cada uno y ``b - a`` con IC 95 %
+        por bootstrap pareado agrupado por paciente.
+        """
+        task = self.task if task is None else task
+        done = [spec for spec in specs if self.lookup(spec) is not None]
+        skipped = [self.name(spec) for spec in specs if spec not in done]
+        if skipped:
+            print(f"[plan] sin resultado todavia: {skipped}")
+        if not done:
+            return pd.DataFrame()
+        mask, y, groups = self._task_arrays(self.predictions(done[0], split), task)
+        probs = {self.name(spec): self.predictions(spec, split)["y_prob"].to_numpy()[mask] for spec in done}
+        names = list(probs)
+        rows = []
+        for i, name_a in enumerate(names):
+            for name_b in names[i + 1 :]:
+                delta = PairedBootstrap.auc_delta(
+                    y, probs[name_a], probs[name_b], groups=groups, samples=self.bootstrap_samples, seed=int(self.config["GENERAL"]["RANDOM_SEED"])
+                )
+                rows.append(
+                    {
+                        "a": name_a,
+                        "b": name_b,
+                        "pr_auc_a": delta["pr_auc_ref"],
+                        "pr_auc_b": delta["pr_auc_alt"],
+                        "pr_auc_b_minus_a": delta["pr_auc_delta"],
+                        "pr_auc_ci_low": delta.get("pr_auc_delta_ci_low"),
+                        "pr_auc_ci_high": delta.get("pr_auc_delta_ci_high"),
+                        "roc_auc_a": delta["roc_auc_ref"],
+                        "roc_auc_b": delta["roc_auc_alt"],
+                        "roc_auc_b_minus_a": delta["roc_auc_delta"],
+                        "roc_auc_ci_low": delta.get("roc_auc_delta_ci_low"),
+                        "roc_auc_ci_high": delta.get("roc_auc_delta_ci_high"),
+                    }
+                )
+        return pd.DataFrame(rows)
+
     def top(self, specs, k: int = 2, *, split: str = "val", task=None) -> list[RunSpec]:
         """Los ``k`` mejores por PR-AUC sobre las mismas imagenes."""
         task = self.task if task is None else task
@@ -550,8 +596,17 @@ class ExperimentPlan:
             rows.append(row)
         return pd.DataFrame(rows)
 
-    def seed_summary(self, groups: dict, *, split: str = "test", task=None) -> pd.DataFrame:
-        """Media ± desvio entre semillas de las metricas clinicas: ``{"config": [RunSpec, ...]}``."""
+    def seed_summary(self, groups, *, split: str = "test", task=None) -> pd.DataFrame:
+        """Media ± desvio entre semillas de las metricas clinicas.
+
+        ``groups``: ``{"config": [RunSpec, ...]}`` o una lista de ``RunSpec`` (se
+        agrupan por configuracion, ignorando la semilla).
+        """
+        if not isinstance(groups, dict):
+            grouped: dict[str, list] = {}
+            for spec in groups:
+                grouped.setdefault(self.name(spec.with_seed(None)), []).append(spec)
+            groups = grouped
         rows = []
         for label, specs in groups.items():
             done = [spec for spec in specs if self.lookup(spec) is not None]
