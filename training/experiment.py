@@ -11,20 +11,25 @@ from src.dataset.provider import build_dataset_provider
 from src.dataset.splits import SplitManager
 from src.model_builder import ModelBuilder, ModelBuilderFactory
 from src.tracking.comet import CometTracker
-from src.training.evaluator import Predictor, ThresholdSelector
-from src.training.mode import TrainingMode, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
+from src.training.evaluator import BreastAggregation, ClinicalMetrics, Predictor, ThresholdSelector
+from src.training.mode import TrainingMode, resized_size_label, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
 from src.training.resources import GpuResources
 from src.training.resume import TrainingResume, epochs_completed
-from src.training.stage_runner import TrainingStageRunner
+from src.training.stage_runner import TrainingStageRunner, stages_from_state, training_progress
 from src.training.timer import TrainingTimer, sample_memory_usage
 
 
-def resolve_experiment_name(config, mode, backbone_name, *, input_size=None, suffix=None):
+def resolve_experiment_name(config, mode, backbone_name, *, input_size=None, suffix=None, seed=None, include_seed=True):
     """Nombre Comet/checkpoint de una corrida y el input_size que va a usar.
 
-    Es el mismo calculo que hace ``TrainingExperiment.run``; el runner de fases
-    lo usa para saber si una corrida ya existe antes de construir nada.
+    Es el mismo calculo que hace ``TrainingExperiment.run``; el plan lo usa para
+    saber si una corrida ya existe antes de construir nada.
+    El nombre siempre termina en ``_seed{N}`` (``seed`` o ``GENERAL.RANDOM_SEED``);
+    ``include_seed=False`` da el nombre de la configuracion, para agrupar semillas.
     """
+    if include_seed:
+        seed = config["GENERAL"]["RANDOM_SEED"] if seed is None else seed
+        suffix = "_".join(part for part in (suffix, f"seed{int(seed)}") if part)
     mode_name_raw = mode
     mode = TrainingMode.parse(mode)
     native_size = get_backbone(backbone_name).input_size
@@ -295,6 +300,16 @@ class TrainingExperiment:
                 resume.begin(comet_key)
                 experiment.log_parameter("RESUME_COUNT", resume.resume_count)
                 experiment.log_other("resume_store", resume.store.location)
+            tracker.log_matrix_coordinates(
+                backbone=backbone_name,
+                arch=f"resized_{resized_size_label(input_size)}" if mode == TrainingMode.RESIZED else str(mode),
+                seed=int(general["RANDOM_SEED"]),
+                label=str(general.get("LABEL", "A")),
+            )
+            tracker.log_run_status(
+                "training",
+                progress=training_progress(config, stages_from_state(resume.state)) if resume is not None else 0.0,
+            )
             if not tracker.resumed:
                 tracker.log_dataset_class_counts(train=train_df, val=val_df, test=test_df)
                 tracker.log_deterministic_input_samples(
@@ -333,6 +348,7 @@ class TrainingExperiment:
                 epoch_offset += epochs_completed(history)
             if resume is not None:
                 resume.mark_trained()
+            tracker.log_run_status("evaluating", progress=1.0)
             tracker.log_training_timing_summary(training_timer)
             best_global_checkpoint = model.load_best_global_checkpoint()
             tracker.log_global_checkpoint_restore(best_global_checkpoint)
@@ -370,14 +386,12 @@ class TrainingExperiment:
                 prediction_paths["test"] = self._export_predictions(
                     exp_name, "test", test_df, y_test_true, y_test_prob
                 )
-            bootstrap_intervals = self._bootstrap_auc_intervals(
-                y_test_true,
-                y_test_prob,
-                samples=int(evaluation_cfg.get("BOOTSTRAP_SAMPLES", 0)),
+            clinical = self._log_clinical_metrics(
+                experiment,
+                {"val": (val_df, y_val_true, y_val_prob), "test": (test_df, y_test_true, y_test_prob)},
+                samples=int(evaluation_cfg.get("BOOTSTRAP_SAMPLES", (config.get("PLAN") or {}).get("BOOTSTRAP_SAMPLES", 1000))),
                 seed=int(general["RANDOM_SEED"]),
             )
-            if bootstrap_intervals:
-                experiment.log_metrics(bootstrap_intervals)
 
             thr_youden = ThresholdSelector.youden_j(y_val_true, y_val_prob)
             thr_recall90 = ThresholdSelector.recall_target(
@@ -397,6 +411,8 @@ class TrainingExperiment:
             )
             y_pred_youden = ThresholdSelector.apply(y_test_prob, thr_youden)
 
+            # log_test_results cierra el experimento: el estado final va antes.
+            tracker.log_run_status("done", progress=1.0)
             comet_url = tracker.log_test_results(
                 config,
                 backbone_name=exp_name,
@@ -446,7 +462,7 @@ class TrainingExperiment:
                 "comet_url": comet_url,
                 "comet_key": comet_key,
                 "random_seed": int(general["RANDOM_SEED"]),
-                **bootstrap_intervals,
+                **clinical,
                 **sample_memory_usage(),
             }
             for stage, stage_summary in training_timer.stage_summaries.items():
@@ -480,6 +496,11 @@ class TrainingExperiment:
             traceback.print_exc()
             if experiment is not None:
                 try:
+                    CometTracker(experiment).log_run_status("failed")
+                    experiment.log_other("run_error", f"{type(exc).__name__}: {exc}"[:500])
+                except Exception:
+                    pass
+                try:
                     experiment.end()
                 except Exception:
                     pass
@@ -503,42 +524,32 @@ class TrainingExperiment:
         return result_builder
 
     @staticmethod
-    def _bootstrap_auc_intervals(
-        y_true,
-        y_prob,
-        *,
-        samples: int,
-        seed: int,
-    ) -> dict[str, float]:
-        """Intervalos bootstrap estratificados para ROC-AUC y PR-AUC."""
-        if samples <= 0:
-            return {}
-        from sklearn.metrics import average_precision_score, roc_auc_score
-
-        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
-        y_prob = np.asarray(y_prob, dtype=np.float64).reshape(-1)
-        positive = np.flatnonzero(y_true == 1)
-        negative = np.flatnonzero(y_true == 0)
-        if len(positive) == 0 or len(negative) == 0:
-            return {}
-        rng = np.random.default_rng(seed)
-        roc_values = np.empty(samples, dtype=np.float64)
-        pr_values = np.empty(samples, dtype=np.float64)
-        for index in range(samples):
-            sampled = np.concatenate(
-                [
-                    rng.choice(positive, size=len(positive), replace=True),
-                    rng.choice(negative, size=len(negative), replace=True),
-                ]
-            )
-            roc_values[index] = roc_auc_score(y_true[sampled], y_prob[sampled])
-            pr_values[index] = average_precision_score(y_true[sampled], y_prob[sampled])
-        return {
-            "test_roc_auc_ci_low": float(np.quantile(roc_values, 0.025)),
-            "test_roc_auc_ci_high": float(np.quantile(roc_values, 0.975)),
-            "test_pr_auc_ci_low": float(np.quantile(pr_values, 0.025)),
-            "test_pr_auc_ci_high": float(np.quantile(pr_values, 0.975)),
-        }
+    def _log_clinical_metrics(experiment, splits, *, samples: int, seed: int) -> dict[str, float]:
+        """Metricas clinicas de val y test por imagen (``{split}_*``) y por mama
+        (``{split}_breast_*``, maximo entre vistas), con el umbral de Youden elegido
+        en val en cada nivel, curva de calibracion y, en test, IC 95 % agrupado por paciente.
+        Devuelve lo logueado."""
+        levels = {}
+        for split, (frame, y_true, y_prob) in splits.items():
+            groups = frame["patient_id"].astype(str).to_numpy() if "patient_id" in frame.columns and len(frame) == len(y_prob) else None
+            levels[(split, "image")] = (y_true, y_prob, groups)
+            breast = BreastAggregation.aggregate(frame, y_true, y_prob)
+            if breast is not None:
+                levels[(split, "breast")] = breast
+        out: dict[str, float] = {}
+        for (split, level), (y_true, y_prob, groups) in levels.items():
+            if ("val", level) not in levels:
+                continue
+            threshold = ThresholdSelector.youden_j(*levels[("val", level)][:2])
+            prefix = split if level == "image" else f"{split}_breast"
+            metrics = ClinicalMetrics.compute(y_true, y_prob, threshold=threshold)
+            if split == "test":
+                metrics.update(ClinicalMetrics.bootstrap_ci(y_true, y_prob, groups=groups, samples=samples, seed=seed))
+            out.update({f"{prefix}_{key}": float(value) for key, value in metrics.items() if value is not None and np.isfinite(value)})
+            mean_prob, frac_pos, _ = ClinicalMetrics.calibration_curve(y_true, y_prob)
+            experiment.log_curve(f"calibration_{prefix}", x=mean_prob.tolist(), y=frac_pos.tolist(), overwrite=True)
+        experiment.log_metrics(out)
+        return out
 
     @staticmethod
     def _log_predictions(experiment, split_name: str, table, y_prob) -> None:

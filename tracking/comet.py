@@ -96,12 +96,15 @@ class CometEpochLogger(keras.callbacks.Callback):
         epoch_offset: int = 0,
         stage: int | None = None,
         monitor: str | None = None,
+        progress_fn=None,
     ):
         super().__init__()
         self.experiment = experiment
         self.epoch_offset = epoch_offset
         self.stage = stage
         self.monitor = _normalize_monitor_name(monitor) if monitor else None
+        # epocas hechas en la etapa -> avance en [0, 1] (``run_progress``).
+        self.progress_fn = progress_fn
 
     def on_train_begin(self, logs=None):
         # Alinear step/epoch internos de Comet con el contador global de epocas.
@@ -125,7 +128,38 @@ class CometEpochLogger(keras.callbacks.Callback):
                 step=global_epoch,
                 epoch=global_epoch,
             )
+        if self.progress_fn is not None:
+            metrics["run_progress"] = float(self.progress_fn(epoch + 1))
         self.experiment.log_metrics(metrics, step=global_epoch, epoch=global_epoch)
+
+
+# Estado de la corrida para monitorear la matriz: texto en ``run_status`` (other)
+# y codigo numerico en ``run_status_code`` (metrica, ordenado por avance para
+# colorear paneles). ``pending`` y ``partial`` solo aparecen en la tabla del plan.
+RUN_STATUS_CODES = {"failed": -1, "pending": 0, "partial": 1, "training": 2, "evaluating": 3, "done": 4}
+
+
+def log_run_status(experiment, status: str, *, progress: float | None = None) -> None:
+    """Loguea ``run_status``, ``run_status_code`` y opcionalmente ``run_progress`` (0-1)."""
+    if status not in RUN_STATUS_CODES:
+        raise ValueError(f"run_status invalido: {status!r} (esperado {sorted(RUN_STATUS_CODES)})")
+    experiment.log_other("run_status", status)
+    metrics = {"run_status_code": RUN_STATUS_CODES[status]}
+    if progress is not None:
+        metrics["run_progress"] = float(progress)
+    experiment.log_metrics(metrics)
+
+
+def log_matrix_coordinates(experiment, *, backbone: str, arch: str, seed: int, label: str) -> None:
+    """Fila y columna de la corrida en la matriz (others ``matrix_*``, para agrupar la vista)."""
+    experiment.log_others(
+        {
+            "matrix_backbone": backbone,
+            "matrix_arch": arch,
+            "matrix_seed": int(seed),
+            "matrix_label": label,
+        }
+    )
 
 
 def log_stage_timing(experiment, stage: int, summary: dict[str, float], *, step: int) -> None:
@@ -895,6 +929,12 @@ class CometTracker:
     @staticmethod
     def log_stage_timing(experiment, stage: int, summary: dict[str, float], *, step: int) -> None:
         log_stage_timing(experiment, stage, summary, step=step)
+
+    def log_run_status(self, status: str, *, progress: float | None = None) -> None:
+        log_run_status(self.experiment, status, progress=progress)
+
+    def log_matrix_coordinates(self, **kwargs) -> None:
+        log_matrix_coordinates(self.experiment, **kwargs)
 
     @staticmethod
     def log_checkpoint_restore(

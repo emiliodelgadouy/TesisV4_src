@@ -38,18 +38,13 @@ def _as_float(value) -> float | None:
 
 
 class CometRunIndex:
-    """Corridas no archivadas del proyecto, indexadas por nombre de experimento.
+    """Corridas no archivadas del proyecto, indexadas por nombre de experimento."""
 
-    ``done_since`` (``YYYY-MM-DD``) descarta corridas anteriores a esa fecha: sirve
-    para no tomar como hechas las de una version vieja del codigo.
-    """
-
-    def __init__(self, config: dict[str, Any], *, done_since: str | None = None) -> None:
+    def __init__(self, config: dict[str, Any]) -> None:
         comet_cfg = config["COMET"]
         self.api_key = comet_cfg.get("API_KEY") or COMET_API_KEY or None
         self.workspace = comet_cfg.get("WORKSPACE")
         self.project_name = comet_cfg["PROJECT_NAME"]
-        self.done_since = datetime.fromisoformat(done_since).date() if done_since else None
         self._api = None
         self._by_name: dict[str, list] | None = None
         self._finished: dict[str, dict | None] = {}
@@ -81,7 +76,7 @@ class CometRunIndex:
         self._finished.pop(name, None)
         self._by_name = None
 
-    def _candidates(self, name: str, *, apply_since: bool = True) -> list:
+    def _candidates(self, name: str) -> list:
         if self._by_name is None:
             self.refresh()
         rows = []
@@ -89,17 +84,15 @@ class CometRunIndex:
             meta = exp.get_metadata() or {}
             start_ms = int(meta.get("startTimeMillis") or 0)
             started = datetime.fromtimestamp(start_ms / 1000).astimezone() if start_ms else None
-            if apply_since and self.done_since and (started is None or started.date() < self.done_since):
-                continue
             rows.append((start_ms, started, exp))
         rows.sort(key=lambda row: row[0], reverse=True)
         return rows
 
     def experiments_named(self, name: str, *, fresh: bool = False) -> list:
-        """Experimentos no archivados con ese nombre, el mas nuevo primero (sin corte de fecha)."""
+        """Experimentos no archivados con ese nombre, el mas nuevo primero."""
         if fresh:
             self._by_name = None
-        return [exp for _, _, exp in self._candidates(name, apply_since=False)]
+        return [exp for _, _, exp in self._candidates(name)]
 
     def finished(self, name: str) -> dict | None:
         """Resumen de la corrida terminada mas reciente con ese nombre, o None."""

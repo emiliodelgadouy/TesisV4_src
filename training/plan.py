@@ -1,4 +1,4 @@
-"""Plan de experimentos por fases: repetibles (resume, semillas, procedencia) y contrastables.
+"""Plan de experimentos: repetibles (resume, semillas, procedencia) y contrastables.
 
 Repetible:
 
@@ -6,7 +6,7 @@ Repetible:
   ``resume_*`` del experimento) o en una carpeta (``"dir"``). Lo terminado se
   saltea y lo cortado se retoma desde la ultima epoca guardada. Con
   ``RESUME.SKIP_IF_IN_COMET`` cuenta como hecha una corrida que Comet ya tiene
-  terminada (desde ``RESUME.COMET_DONE_SINCE``).
+  terminada con el mismo nombre.
 - Cada corrida fija sus semillas y loguea commit de ``src``, hash del config,
   hash de los splits, versiones de Python/TF/Keras/comet_ml, GPU y esquema de
   etiqueta (``GENERAL.PROVENANCE_*`` / ``LABEL*``).
@@ -23,8 +23,6 @@ Contrastable:
   par de corridas se compara despues sin reentrenar.
 - ``evaluate`` y ``pairwise`` reportan metricas clinicas y diferencias de todos
   los pares con IC 95 % (bootstrap pareado agrupado por paciente), sin elegir.
-- ``compare`` / ``top`` si eligen: un candidato pasa si mejora la PR-AUC por
-  mas de ``PLAN.MARGIN`` y el IC 95 % de la diferencia queda por encima de 0.
 """
 
 from __future__ import annotations
@@ -35,24 +33,41 @@ import io
 import json
 import subprocess
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
+import comet_ml
 import numpy as np
 import pandas as pd
 
 from src.dataset.target import DEFAULT_LABEL, LABEL_SCHEMES, apply_label_scheme, birads_of
+from src.tracking.comet import RUN_STATUS_CODES
 from src.tracking.comet_results import CometRunIndex
 from src.tracking.comet_store import CometRunStore
-from src.training.evaluator import ClinicalMetrics, PairedBootstrap
+from src.training.evaluator import BreastAggregation, ClinicalMetrics, PairedBootstrap, ThresholdSelector
 from src.training.experiment import TrainingExperiment, resolve_experiment_name
 from src.training.inference import build_trained_model, predict_dataframe
 from src.training.mode import TrainingMode, normalize_input_size, resized_size_label
 from src.training.resources import GpuResources, RandomSeeds
 from src.training.resume import RunStore
+from src.training.stage_runner import stages_from_state, training_progress
 
 DRIVE_ROOT = Path("/content/drive")
-DEFAULT_MARGIN = 0.02
 GROUP_COLUMN = "patient_id"
+SEED_SUMMARY_METRICS = (
+    "roc_auc",
+    "pr_auc",
+    "pr_auc_over_baseline",
+    "sens_at_spec_90",
+    "sens_at_spec_95",
+    "prec_at_recall_80",
+    "sensitivity",
+    "specificity",
+    "ppv",
+    "npv",
+    "brier",
+    "ece",
+)
 PREDICTION_COLUMNS = ("image_id", "patient_id", "study_id", "laterality", "view", "birads")
 
 
@@ -61,7 +76,8 @@ class RunSpec:
     """Una corrida del plan.
 
     ``seed=None`` usa ``GENERAL.RANDOM_SEED``; ``label=None`` usa el esquema
-    ``A``. Ninguno de los dos agrega sufijo al nombre en ese caso.
+    ``A``. El nombre siempre lleva ``_seed{N}``; la etiqueta agrega ``_lbl{x}``
+    solo si no es A.
     """
 
     mode: str
@@ -77,12 +93,10 @@ class RunSpec:
 
     @property
     def suffix(self) -> str | None:
-        parts = []
+        """Sufijo de etiqueta; la semilla la agrega ``resolve_experiment_name``."""
         if self.label_key != DEFAULT_LABEL:
-            parts.append(f"lbl{self.label_key.lower()}")
-        if self.seed is not None:
-            parts.append(f"seed{self.seed}")
-        return "_".join(parts) or None
+            return f"lbl{self.label_key.lower()}"
+        return None
 
     def with_seed(self, seed: int | None) -> RunSpec:
         return replace(self, seed=seed)
@@ -111,13 +125,15 @@ class RunSpec:
             return 10.0
         return 1.0
 
-    def name(self, config) -> str:
+    def name(self, config, *, include_seed: bool = True) -> str:
         name, _ = resolve_experiment_name(
             config,
             self.mode,
             self.backbone,
             input_size=self.input_size,
             suffix=self.suffix,
+            seed=self.seed,
+            include_seed=include_seed,
         )
         return name
 
@@ -218,14 +234,15 @@ class ExperimentPlan:
         self.backend = resume_cfg.get("BACKEND", "comet") if resume_cfg.get("ENABLED", True) else None
         self.resume_dir = resume_cfg.get("DIR") or "runs"
         self.skip_if_in_comet = bool(resume_cfg.get("SKIP_IF_IN_COMET", True))
-        self.comet = CometRunIndex(config, done_since=resume_cfg.get("COMET_DONE_SINCE"))
+        self.comet = CometRunIndex(config)
         plan_cfg = config.get("PLAN") or {}
-        self.margin = float(plan_cfg.get("MARGIN", DEFAULT_MARGIN))
         self.task = plan_cfg.get("TASK", DEFAULT_LABEL)
         self.bootstrap_samples = int(plan_cfg.get("BOOTSTRAP_SAMPLES", 1000))
-        self.aliases = dict(plan_cfg.get("ALIASES") or {})
         self.weights_cache = Path(plan_cfg.get("WEIGHTS_CACHE", "checkpoints/comet"))
         self.predictions_dir = Path(plan_cfg.get("PREDICTIONS_DIR", "predictions"))
+        # Experimento de Comet con la tabla de estado de la matriz; None/"" lo apaga.
+        self.status_experiment_name = plan_cfg.get("STATUS_EXPERIMENT", "estado_matriz")
+        self._status_exp = None
         self._stores: dict = {}
         self._summaries: dict[str, dict] = {}
         self._predictions: dict[tuple[str, str], pd.DataFrame] = {}
@@ -277,11 +294,6 @@ class ExperimentPlan:
     def name(self, spec: RunSpec) -> str:
         return spec.name(self.config)
 
-    def comet_name(self, spec: RunSpec) -> str:
-        """Nombre en Comet: el canonico o su alias (``PLAN.ALIASES``) para corridas viejas."""
-        name = self.name(spec)
-        return self.aliases.get(name, name)
-
     def _store(self, spec: RunSpec):
         if self.backend is None:
             return None
@@ -309,8 +321,8 @@ class ExperimentPlan:
             return "done", {**(state.get("summary") or {}), "source": "resume"}
         if state and state.get("status") in ("training", "trained"):
             return "partial", None
-        if self.skip_if_in_comet or name != self.comet_name(spec):
-            summary = self.comet.finished(self.comet_name(spec))
+        if self.skip_if_in_comet:
+            summary = self.comet.finished(name)
             if summary is not None:
                 return "comet", summary
         return "pending", None
@@ -321,27 +333,115 @@ class ExperimentPlan:
             return summary
         if status == "partial":
             return None
-        return self.comet.finished(self.comet_name(spec))
+        return self.comet.finished(self.name(spec))
 
-    def show(self, specs) -> pd.DataFrame:
+    # ------------------------------------------------------------------ monitoreo
+
+    def progress(self, spec: RunSpec, status: str | None = None) -> float:
+        """Avance de entrenamiento en [0, 1]: 1 si termino, epocas hechas si quedo a medias."""
+        status = status or self.status(spec)[0]
+        if status in ("done", "comet"):
+            return 1.0
+        store = self._store(spec)
+        if status != "partial" or store is None:
+            return 0.0
+        return training_progress(self.config, stages_from_state(store.load()))
+
+    def status_table(self, specs, *, preguntas=None, running: RunSpec | None = None) -> pd.DataFrame:
+        """Una fila por corrida con estado, avance y resultados, para la vista de monitoreo.
+
+        ``status``: ``pending`` | ``training`` (la que corre ahora) | ``partial``
+        (cortada, se retoma) | ``failed`` | ``done``. ``preguntas``: ``{pregunta:
+        {grupo: [RunSpec]}}`` (o ``{pregunta: [RunSpec]}``).
+        """
+        por_nombre: dict[str, dict] = {}
+        for pregunta, grupos in (preguntas or {}).items():
+            listas = grupos.values() if isinstance(grupos, dict) else [grupos]
+            for lista in listas:
+                for spec in lista:
+                    por_nombre.setdefault(self.name(spec), {})[pregunta] = None
+        running_name = self.name(running) if running is not None else None
         rows = []
         for spec in specs:
-            status, summary = self.status(spec)
             name = self.name(spec)
-            if status == "pending" and name in self.failures:
+            status, summary = self.status(spec)
+            progress = self.progress(spec, status)
+            if status == "comet":
+                status = "done"
+            if name == running_name:
+                status = "training"
+            elif status == "pending" and name in self.failures:
                 status = "failed"
+            summary = summary or {}
+            seconds = summary.get("training_wall_seconds")
             rows.append(
                 {
                     "experiment": name,
                     "backbone": spec.backbone,
                     "arch": spec.arch,
-                    "comet_name": self.comet_name(spec),
+                    "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
+                    "label": spec.label_key,
+                    "preguntas": ", ".join(por_nombre.get(name, {})),
                     "status": status,
+                    "status_code": RUN_STATUS_CODES[status],
+                    "progress": round(progress, 4),
                     "cost": round(spec.estimated_cost, 1),
-                    "val_best_metric": (summary or {}).get("val_best_metric"),
+                    "hours": round(float(seconds) / 3600, 3) if seconds is not None else None,
+                    "val_best_metric": summary.get("val_best_metric"),
+                    "test_roc_auc": summary.get("test_roc_auc"),
+                    "test_pr_auc": summary.get("test_pr_auc"),
+                    "error": self.failures.get(name, "")[:300],
+                    "comet_url": summary.get("comet_url"),
                 }
             )
         return pd.DataFrame(rows)
+
+    def _status_experiment(self):
+        """Experimento de Comet que guarda la tabla de estado de la matriz (se reusa entre sesiones)."""
+        if self._status_exp is None:
+            name = self.status_experiment_name
+            found = self.comet.experiments_named(name, fresh=True)
+            if found:
+                self._status_exp = found[0]
+            else:
+                workspace, project = self.comet._resolve_project()
+                self._status_exp = comet_ml.APIExperiment(api_key=self.comet.api_key, workspace=workspace, project_name=project, experiment_name=name)
+                self._status_exp.add_tag("estado")
+                self.comet.forget(name)
+        return self._status_exp
+
+    def publish_status(self, specs, *, preguntas=None, running: RunSpec | None = None) -> pd.DataFrame:
+        """Sube la tabla de estado como asset ``estado_matriz.csv`` (se pisa) y metricas
+        agregadas (``runs_*``, ``hours_done``, ``matrix_progress``) al experimento
+        ``PLAN.STATUS_EXPERIMENT``. Un error de red no corta la matriz."""
+        table = self.status_table(specs, preguntas=preguntas, running=running)
+        if not self.status_experiment_name or table.empty:
+            return table
+        try:
+            exp = self._status_experiment()
+            self.predictions_dir.mkdir(parents=True, exist_ok=True)
+            path = self.predictions_dir / "estado_matriz.csv"
+            table.to_csv(path, index=False)
+            exp.log_asset(str(path), name="estado_matriz.csv", overwrite=True)
+            counts = table["status"].value_counts()
+            cost = table["cost"].astype(float)
+            exp.log_metrics(
+                {
+                    "runs_total": len(table),
+                    "runs_done": int(counts.get("done", 0)),
+                    "runs_training": int(counts.get("training", 0)),
+                    "runs_partial": int(counts.get("partial", 0)),
+                    "runs_failed": int(counts.get("failed", 0)),
+                    "runs_pending": int(counts.get("pending", 0)),
+                    "hours_done": float(pd.to_numeric(table["hours"], errors="coerce").sum()),
+                    "matrix_progress": float((cost * table["progress"]).sum() / cost.sum()) if cost.sum() else 0.0,
+                }
+            )
+            exp.log_other("updated_at", datetime.now().astimezone().isoformat(timespec="seconds"))
+            exp.log_other("running", self.name(running) if running is not None else "")
+        except Exception as exc:
+            print(f"[plan] no pude publicar el estado en Comet ({type(exc).__name__}: {exc})")
+        return table
 
     # ------------------------------------------------------------------ correr
 
@@ -403,11 +503,20 @@ class ExperimentPlan:
         self._remember(name, experiment.summary)
         return self._summaries.get(name, {})
 
-    def run_all(self, specs, *, continue_on_error: bool = False) -> pd.DataFrame:
+    def run_all(self, specs, *, continue_on_error: bool = False, preguntas=None) -> pd.DataFrame:
         """Corre en orden. Con ``continue_on_error`` un fallo (p. ej. OOM) se anota en
-        ``failures`` y se sigue con la siguiente; al volver a correr se reintenta."""
+        ``failures`` y se sigue con la siguiente; al volver a correr se reintenta.
+
+        Antes y despues de cada corrida publica la tabla de estado en Comet
+        (``publish_status``); ``preguntas`` agrega la columna de preguntas.
+        """
+        specs = list(specs)
+        self.publish_status(specs, preguntas=preguntas)
         for spec in specs:
             name = self.name(spec)
+            pending = self._fresh_status(spec)[0] not in ("done", "comet")
+            if pending:
+                self.publish_status(specs, preguntas=preguntas, running=spec)
             try:
                 self.run(spec)
                 self.failures.pop(name, None)
@@ -416,10 +525,13 @@ class ExperimentPlan:
                     raise
                 self.failures[name] = f"{type(exc).__name__}: {exc}"
                 print(f"[plan] {name}: FALLO, sigo con la siguiente ({self.failures[name][:300]})")
+            finally:
+                if pending:
+                    self.publish_status(specs, preguntas=preguntas)
         failed = [self.name(spec) for spec in specs if self.name(spec) in self.failures]
         if failed:
             print(f"[plan] {len(failed)} corridas fallaron en esta sesion: {failed}")
-        return self.table(specs)
+        return self.status_table(specs, preguntas=preguntas)
 
     @staticmethod
     def by_cost(specs) -> list[RunSpec]:
@@ -502,7 +614,7 @@ class ExperimentPlan:
             for entry in state.get("best_checkpoints", []):
                 if store.has_file(entry.get("file")):
                     return store.path(entry["file"])
-        return self.comet.download_final_weights(self.comet_name(spec), self.weights_cache)
+        return self.comet.download_final_weights(self.name(spec), self.weights_cache)
 
     def final_weights(self, spec: RunSpec) -> Path:
         status, _ = self.status(spec)
@@ -542,7 +654,7 @@ class ExperimentPlan:
                     birads_by_image = pd.Series(birads_of(frame).to_numpy(), index=frame["image_id"].astype(str))
                     cached["birads"] = cached["image_id"].map(birads_by_image)
                 if set(cached["image_id"]) != set(frame["image_id"].astype(str)):
-                    print(f"[plan] {asset_name} de {self.comet_name(spec)} no coincide con el split actual; recalculo")
+                    print(f"[plan] {asset_name} de {self.name(spec)} no coincide con el split actual; recalculo")
                     cached = None
         if cached is None:
             print(f"[plan] {self.name(spec)}: predigo {split} completo ({len(frame)} imagenes)")
@@ -574,8 +686,26 @@ class ExperimentPlan:
         groups = predictions[GROUP_COLUMN].astype(str).to_numpy()[mask] if GROUP_COLUMN in predictions.columns else None
         return mask, y, groups
 
-    def evaluate(self, specs, *, split: str = "val", tasks=None) -> pd.DataFrame:
-        """Metricas clinicas de cada corrida sobre las mismas imagenes, por tarea."""
+    def _level_arrays(self, predictions: pd.DataFrame, task, level: str):
+        """``(y_true, y_prob, groups)`` de la tarea ``task`` por imagen o por mama (``level="breast"``)."""
+        mask, y, groups = self._task_arrays(predictions, task)
+        prob = predictions["y_prob"].to_numpy()[mask]
+        if level == "image":
+            return y, prob, groups
+        if level != "breast":
+            raise ValueError(f"level debe ser 'image' o 'breast', no {level!r}")
+        breast = BreastAggregation.aggregate(predictions.loc[mask].reset_index(drop=True), y, prob)
+        if breast is None:
+            raise ValueError("Las predicciones no tienen study_id/patient_id + laterality para agregar por mama")
+        return breast
+
+    def evaluate(self, specs, *, split: str = "val", tasks=None, level: str = "image", ci: bool = False) -> pd.DataFrame:
+        """Metricas clinicas de cada corrida sobre las mismas imagenes, por tarea.
+
+        ``level="breast"`` agrega por mama (maximo entre vistas). Las metricas de
+        umbral usan el Youden de la misma corrida en val, al mismo nivel. ``ci``
+        agrega el IC 95 % de ROC-AUC y PR-AUC (bootstrap agrupado por paciente).
+        """
         tasks = list(tasks) if tasks is not None else [self.task]
         pending = [self.name(spec) for spec in specs if self.lookup(spec) is None]
         if pending:
@@ -586,8 +716,11 @@ class ExperimentPlan:
                 continue
             predictions = self.predictions(spec, split)
             for task in tasks:
-                mask, y, _ = self._task_arrays(predictions, task)
-                metrics = ClinicalMetrics.compute(y, predictions["y_prob"].to_numpy()[mask])
+                y, prob, groups = self._level_arrays(predictions, task, level)
+                y_val, prob_val, _ = self._level_arrays(self.predictions(spec, "val"), task, level)
+                metrics = ClinicalMetrics.compute(y, prob, threshold=ThresholdSelector.youden_j(y_val, prob_val))
+                if ci:
+                    metrics.update(ClinicalMetrics.bootstrap_ci(y, prob, groups=groups, samples=self.bootstrap_samples, seed=int(self.config["GENERAL"]["RANDOM_SEED"])))
                 rows.append(
                     {
                         "experiment": self.name(spec),
@@ -596,88 +729,21 @@ class ExperimentPlan:
                         "label": spec.label_key,
                         "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
                         "split": split,
+                        "level": level,
                         "task": _task_scheme(task)["title"],
                         **metrics,
                     }
                 )
         return pd.DataFrame(rows)
 
-    def matrix(self, specs, *, split: str = "val", metric: str = "pr_auc", task=None) -> pd.DataFrame:
-        """Vista backbone × arquitectura de ``metric`` (media entre semillas si hay varias).
+    # ------------------------------------------------------------------ comparar
 
-        Si hay mas de una etiqueta de entrenamiento, las filas son ``(backbone, label)``.
-        """
-        table = self.evaluate(specs, split=split, tasks=[self.task if task is None else task])
-        if table.empty or metric not in table.columns:
-            return pd.DataFrame()
-        columns = list(dict.fromkeys(spec.arch for spec in sorted(specs, key=lambda spec: spec.estimated_cost)))
-        if len({spec.label_key for spec in specs}) > 1:
-            index = ["backbone", "label"]
-            rows = list(dict.fromkeys((spec.backbone, spec.label_key) for spec in sorted(specs, key=lambda spec: spec.label_key)))
-            rows = sorted(rows, key=lambda row: [spec.backbone for spec in specs].index(row[0]))
-            rows = pd.MultiIndex.from_tuples(rows, names=index)
-        else:
-            index = "backbone"
-            rows = list(dict.fromkeys(spec.backbone for spec in specs))
-        pivot = table.pivot_table(index=index, columns="arch", values=metric, aggfunc="mean")
-        return pivot.reindex(index=rows, columns=columns).round(3)
-
-    # ------------------------------------------------------------------ decidir
-
-    def compare(self, reference: RunSpec, candidates, *, split: str = "val", task=None, margin: float | None = None):
-        """Candidatos vs referencia sobre las mismas imagenes de ``split`` y la tarea ``task``.
-
-        Pasa un candidato si ``Δ PR-AUC > margin`` y el IC 95 % pareado (bootstrap
-        agrupado por paciente) queda por encima de 0. Gana el mejor que pasa; si
-        ninguno, la referencia. Devuelve ``(tabla, ganador)``.
-        """
-        task = self.task if task is None else task
-        margin = self.margin if margin is None else float(margin)
-        ref_predictions = self.predictions(reference, split)
-        mask, y, groups = self._task_arrays(ref_predictions, task)
-        ref_prob = ref_predictions["y_prob"].to_numpy()[mask]
-        ref_metrics = ClinicalMetrics.compute(y, ref_prob)
-        rows = [{"experiment": self.name(reference), "role": "referencia", **ref_metrics, "pasa": None}]
-        winner, winner_value = reference, ref_metrics.get("pr_auc", float("-inf"))
-        for spec in candidates:
-            if self.lookup(spec) is None:
-                rows.append({"experiment": self.name(spec), "role": "candidato", "pasa": None})
-                continue
-            prob = self.predictions(spec, split)["y_prob"].to_numpy()[mask]
-            delta = PairedBootstrap.auc_delta(
-                y, ref_prob, prob, groups=groups, samples=self.bootstrap_samples, seed=int(self.config["GENERAL"]["RANDOM_SEED"])
-            )
-            metrics = ClinicalMetrics.compute(y, prob)
-            passes = bool(delta["pr_auc_delta"] > margin and delta.get("pr_auc_delta_ci_low", float("-inf")) > 0)
-            rows.append(
-                {
-                    "experiment": self.name(spec),
-                    "role": "candidato",
-                    **metrics,
-                    "pr_auc_delta": delta["pr_auc_delta"],
-                    "pr_auc_delta_ci_low": delta.get("pr_auc_delta_ci_low"),
-                    "pr_auc_delta_ci_high": delta.get("pr_auc_delta_ci_high"),
-                    "roc_auc_delta": delta["roc_auc_delta"],
-                    "roc_auc_delta_ci_low": delta.get("roc_auc_delta_ci_low"),
-                    "roc_auc_delta_ci_high": delta.get("roc_auc_delta_ci_high"),
-                    "pasa": passes,
-                }
-            )
-            if passes and metrics["pr_auc"] > winner_value:
-                winner, winner_value = spec, metrics["pr_auc"]
-        table = pd.DataFrame(rows)
-        missing = table.loc[table["pasa"].isna() & (table["role"] == "candidato"), "experiment"].tolist()
-        if missing:
-            print(f"[plan] sin resultado todavia: {missing}")
-        title = _task_scheme(task)["title"]
-        print(f"[plan] {split}, tarea {title}, margen {margin:.3f} + IC pareado > 0 → gana {self.name(winner)} (PR-AUC {winner_value:.4f})")
-        return table, winner
-
-    def pairwise(self, specs, *, split: str = "val", task=None) -> pd.DataFrame:
+    def pairwise(self, specs, *, split: str = "val", task=None, level: str = "image") -> pd.DataFrame:
         """Todas contra todas sobre las mismas imagenes, sin elegir ganador.
 
         Una fila por par ``(a, b)``: metricas de cada uno y ``b - a`` con IC 95 %
-        por bootstrap pareado agrupado por paciente.
+        por bootstrap pareado agrupado por paciente. ``level="breast"`` compara
+        por mama (maximo entre vistas).
         """
         task = self.task if task is None else task
         done = [spec for spec in specs if self.lookup(spec) is not None]
@@ -686,8 +752,8 @@ class ExperimentPlan:
             print(f"[plan] sin resultado todavia: {skipped}")
         if not done:
             return pd.DataFrame()
-        mask, y, groups = self._task_arrays(self.predictions(done[0], split), task)
-        probs = {self.name(spec): self.predictions(spec, split)["y_prob"].to_numpy()[mask] for spec in done}
+        y, _, groups = self._level_arrays(self.predictions(done[0], split), task, level)
+        probs = {self.name(spec): self._level_arrays(self.predictions(spec, split), task, level)[1] for spec in done}
         names = list(probs)
         rows = []
         for i, name_a in enumerate(names):
@@ -697,6 +763,7 @@ class ExperimentPlan:
                 )
                 rows.append(
                     {
+                        "level": level,
                         "a": name_a,
                         "b": name_b,
                         "pr_auc_a": delta["pr_auc_ref"],
@@ -713,42 +780,9 @@ class ExperimentPlan:
                 )
         return pd.DataFrame(rows)
 
-    def top(self, specs, k: int = 2, *, split: str = "val", task=None) -> list[RunSpec]:
-        """Los ``k`` mejores por PR-AUC sobre las mismas imagenes."""
-        task = self.task if task is None else task
-        scored = []
-        for spec in specs:
-            if self.lookup(spec) is None:
-                continue
-            predictions = self.predictions(spec, split)
-            mask, y, _ = self._task_arrays(predictions, task)
-            scored.append((ClinicalMetrics.compute(y, predictions["y_prob"].to_numpy()[mask])["pr_auc"], spec))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        return [spec for _, spec in scored[:k]]
-
     # ------------------------------------------------------------------ reportes
 
-    def table(self, specs, *, show_test: bool = False) -> pd.DataFrame:
-        rows = []
-        for spec in specs:
-            summary = self.lookup(spec) or {}
-            row = {
-                "experiment": self.name(spec),
-                "mode": TrainingMode.parse(spec.mode),
-                "backbone": spec.backbone,
-                "label": spec.label_key,
-                "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
-                "val_best_metric": summary.get("val_best_metric"),
-                "source": summary.get("source"),
-                "comet_url": summary.get("comet_url"),
-            }
-            if show_test:
-                row["test_roc_auc"] = summary.get("test_roc_auc")
-                row["test_pr_auc"] = summary.get("test_pr_auc")
-            rows.append(row)
-        return pd.DataFrame(rows)
-
-    def seed_summary(self, groups, *, split: str = "test", task=None) -> pd.DataFrame:
+    def seed_summary(self, groups, *, split: str = "test", task=None, level: str = "image") -> pd.DataFrame:
         """Media ± desvio entre semillas de las metricas clinicas.
 
         ``groups``: ``{"config": [RunSpec, ...]}`` o una lista de ``RunSpec`` (se
@@ -757,14 +791,14 @@ class ExperimentPlan:
         if not isinstance(groups, dict):
             grouped: dict[str, list] = {}
             for spec in groups:
-                grouped.setdefault(self.name(spec.with_seed(None)), []).append(spec)
+                grouped.setdefault(spec.name(self.config, include_seed=False), []).append(spec)
             groups = grouped
         rows = []
         for label, specs in groups.items():
             done = [spec for spec in specs if self.lookup(spec) is not None]
-            metrics = self.evaluate(done, split=split, tasks=[self.task if task is None else task]) if done else pd.DataFrame()
-            row = {"config": label, "n_seeds": len(done), "split": split}
-            for column in ("roc_auc", "pr_auc", "pr_auc_over_baseline", "sens_at_spec_90", "sens_at_spec_95", "prec_at_recall_80"):
+            metrics = self.evaluate(done, split=split, tasks=[self.task if task is None else task], level=level) if done else pd.DataFrame()
+            row = {"config": label, "n_seeds": len(done), "split": split, "level": level}
+            for column in SEED_SUMMARY_METRICS:
                 values = pd.to_numeric(metrics.get(column, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy()
                 row[f"{column}_mean"] = float(np.mean(values)) if len(values) else None
                 row[f"{column}_std"] = float(np.std(values, ddof=1)) if len(values) > 1 else None

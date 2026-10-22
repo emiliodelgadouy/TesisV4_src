@@ -65,11 +65,31 @@ class Predictor:
         return y_true, y_prob
 
 
+def bootstrap_draws(y_true, *, groups=None, rng):
+    """Generador de indices de remuestreo: por grupo (p. ej. paciente) si hay ``groups``;
+    si no, imagenes con reposicion dentro de cada clase."""
+    y_true = np.asarray(y_true).reshape(-1)
+    if groups is not None:
+        groups = np.asarray(groups).reshape(-1)
+        uniq, inverse = np.unique(groups, return_inverse=True)
+        index_by_group = [np.flatnonzero(inverse == group) for group in range(len(uniq))]
+        while True:
+            picked = rng.integers(0, len(uniq), size=len(uniq))
+            yield np.concatenate([index_by_group[i] for i in picked])
+    positive = np.flatnonzero(y_true == 1)
+    negative = np.flatnonzero(y_true == 0)
+    while True:
+        yield np.concatenate([rng.choice(positive, size=len(positive), replace=True), rng.choice(negative, size=len(negative), replace=True)])
+
+
 class ClinicalMetrics:
-    """Metricas independientes del umbral para comparar modelos sobre las mismas imagenes."""
+    """Metricas para comparar modelos sobre las mismas imagenes: discriminacion,
+    puntos operativos, calibracion y, con ``threshold``, metricas de umbral."""
+
+    CALIBRATION_BINS = 10
 
     @staticmethod
-    def compute(y_true, y_prob) -> dict[str, float]:
+    def compute(y_true, y_prob, *, threshold: float | None = None) -> dict[str, float]:
         from sklearn.metrics import average_precision_score, roc_auc_score
 
         y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
@@ -96,9 +116,121 @@ class ClinicalMetrics:
                 "sens_at_spec_90": sens_at_spec(0.90),
                 "sens_at_spec_95": sens_at_spec(0.95),
                 "prec_at_recall_80": float(precision[ok_recall].max()) if ok_recall.any() else float("nan"),
+                "brier": float(np.mean((y_prob - y_true) ** 2)),
+                "ece": ClinicalMetrics.expected_calibration_error(y_true, y_prob),
             }
         )
+        if threshold is not None:
+            out.update(ClinicalMetrics.at_threshold(y_true, y_prob, threshold))
         return out
+
+    @staticmethod
+    def at_threshold(y_true, y_prob, threshold: float) -> dict[str, float]:
+        """Sensibilidad, especificidad, PPV, NPV, F1 y exactitud balanceada con ``y_prob >= threshold``."""
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_pred = (np.asarray(y_prob, dtype=np.float64).reshape(-1) >= threshold).astype(np.int64)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        tn = int(((y_pred == 0) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+
+        def ratio(num, den):
+            return num / den if den else float("nan")
+
+        sens, spec = ratio(tp, tp + fn), ratio(tn, tn + fp)
+        return {
+            "threshold": float(threshold),
+            "sensitivity": sens,
+            "specificity": spec,
+            "ppv": ratio(tp, tp + fp),
+            "npv": ratio(tn, tn + fn),
+            "f1": ratio(2 * tp, 2 * tp + fp + fn),
+            "balanced_accuracy": (sens + spec) / 2,
+        }
+
+    @classmethod
+    def calibration_curve(cls, y_true, y_prob, *, bins: int | None = None):
+        """Bins de igual ancho en [0, 1]: probabilidad media, fraccion de positivos y n (solo bins no vacios)."""
+        y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+        y_prob = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+        edges = np.linspace(0.0, 1.0, int(bins or cls.CALIBRATION_BINS) + 1)
+        which = np.clip(np.digitize(y_prob, edges[1:-1]), 0, len(edges) - 2)
+        mean_prob, frac_pos, counts = [], [], []
+        for b in range(len(edges) - 1):
+            in_bin = which == b
+            if in_bin.any():
+                mean_prob.append(float(y_prob[in_bin].mean()))
+                frac_pos.append(float(y_true[in_bin].mean()))
+                counts.append(int(in_bin.sum()))
+        return np.asarray(mean_prob), np.asarray(frac_pos), np.asarray(counts)
+
+    @classmethod
+    def expected_calibration_error(cls, y_true, y_prob, *, bins: int | None = None) -> float:
+        mean_prob, frac_pos, counts = cls.calibration_curve(y_true, y_prob, bins=bins)
+        if counts.sum() == 0:
+            return float("nan")
+        return float(np.sum(counts * np.abs(mean_prob - frac_pos)) / counts.sum())
+
+    @staticmethod
+    def bootstrap_ci(y_true, y_prob, *, groups=None, samples: int = 1000, seed: int = 42) -> dict[str, float]:
+        """IC 95 % de ROC-AUC y PR-AUC; remuestrea ``groups`` (paciente) si se pasan."""
+        from sklearn.metrics import average_precision_score, roc_auc_score
+
+        y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        y_prob = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+        if samples <= 0 or np.unique(y_true).size < 2:
+            return {}
+        draws = bootstrap_draws(y_true, groups=groups, rng=np.random.default_rng(seed))
+        roc, pr = [], []
+        for _ in range(int(samples) * 5):
+            if len(roc) >= samples:
+                break
+            idx = next(draws)
+            if np.unique(y_true[idx]).size < 2:
+                continue
+            roc.append(roc_auc_score(y_true[idx], y_prob[idx]))
+            pr.append(average_precision_score(y_true[idx], y_prob[idx]))
+        if not roc:
+            return {}
+        return {
+            "roc_auc_ci_low": float(np.quantile(roc, 0.025)),
+            "roc_auc_ci_high": float(np.quantile(roc, 0.975)),
+            "pr_auc_ci_low": float(np.quantile(pr, 0.025)),
+            "pr_auc_ci_high": float(np.quantile(pr, 0.975)),
+        }
+
+
+class BreastAggregation:
+    """Nivel mama: una fila por (estudio, lateralidad) con la probabilidad maxima entre
+    sus vistas (CC/MLO) y la etiqueta maxima. Es la unidad de decision clinica."""
+
+    KEYS = (("study_id", "laterality"), ("patient_id", "laterality"))
+
+    @classmethod
+    def keys_for(cls, frame) -> list[str] | None:
+        for keys in cls.KEYS:
+            if all(key in frame.columns for key in keys):
+                return list(keys)
+        return None
+
+    @classmethod
+    def aggregate(cls, frame, y_true, y_prob):
+        """``(y_true, y_prob, groups)`` por mama (``groups`` = paciente), o ``None`` si faltan columnas.
+
+        ``frame`` tiene que estar alineado fila a fila con ``y_true`` / ``y_prob``.
+        """
+        keys = cls.keys_for(frame)
+        if keys is None or len(frame) != len(y_prob):
+            return None
+        extra = ["patient_id"] if "patient_id" in frame.columns and "patient_id" not in keys else []
+        table = frame[keys + extra].reset_index(drop=True).copy()
+        table[keys] = table[keys].astype(str)
+        table["y_true"] = np.asarray(y_true, dtype=np.int64).reshape(-1)
+        table["y_prob"] = np.asarray(y_prob, dtype=np.float64).reshape(-1)
+        agg = {"y_true": "max", "y_prob": "max", **{column: "first" for column in extra}}
+        grouped = table.groupby(keys, sort=True).agg(agg).reset_index()
+        groups = grouped["patient_id"].astype(str).to_numpy() if "patient_id" in grouped.columns else None
+        return grouped["y_true"].to_numpy(), grouped["y_prob"].to_numpy(), groups
 
 
 class PairedBootstrap:
@@ -115,26 +247,7 @@ class PairedBootstrap:
         y_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
         prob_ref = np.asarray(prob_ref, dtype=np.float64).reshape(-1)
         prob_alt = np.asarray(prob_alt, dtype=np.float64).reshape(-1)
-        rng = np.random.default_rng(seed)
-        if groups is not None:
-            groups = np.asarray(groups).reshape(-1)
-            uniq = np.unique(groups)
-            index_by_group = [np.flatnonzero(groups == group) for group in uniq]
-
-            def draw():
-                picked = rng.integers(0, len(uniq), size=len(uniq))
-                return np.concatenate([index_by_group[i] for i in picked])
-        else:
-            positive = np.flatnonzero(y_true == 1)
-            negative = np.flatnonzero(y_true == 0)
-
-            def draw():
-                return np.concatenate(
-                    [
-                        rng.choice(positive, size=len(positive), replace=True),
-                        rng.choice(negative, size=len(negative), replace=True),
-                    ]
-                )
+        draws = bootstrap_draws(y_true, groups=groups, rng=np.random.default_rng(seed))
 
         out = {
             "roc_auc_ref": float(roc_auc_score(y_true, prob_ref)),
@@ -146,7 +259,7 @@ class PairedBootstrap:
         for _ in range(int(samples) * 5):
             if len(roc_delta) >= samples:
                 break
-            idx = draw()
+            idx = next(draws)
             yt = y_true[idx]
             if np.unique(yt).size < 2:
                 continue

@@ -23,7 +23,8 @@ requirements, importa Comet antes que TensorFlow y aplica mixed precision.
 - `resized`: un canvas de `CONFIG["RESIZED"]["INPUT_SIZES"]` (enteros o pares
   `(H, W)`). Si la lista no está, el default es 3× el tamaño nativo. El nombre
   puede ser `resized`, `resized_672` o `resized_672x672`; el canvas tiene que
-  estar en la lista.
+  estar en la lista y ser mayor que el tamaño nativo del backbone (los menores
+  o iguales se descartan para ese backbone; pedirlos explícitamente falla).
 - `patch`, `patch_hardneg`.
 - `abmil`: canvas `BAG_GRID × tamaño nativo`, independiente de RESIZED.
 - `abmil_patch_hardneg`: transfiere backbone y proyección densa desde
@@ -37,29 +38,49 @@ con `PATCH_HARDNEG.ALIGN_TO_BAG_GRID=True`.
 
 ## Contrato del notebook
 
-El driver de `multirun.ipynb` es una matriz anclada (`training/plan.py`):
+El driver de `multirun.ipynb` es una matriz de experimentos (`training/plan.py`):
 `ExperimentPlan` corre una lista de `RunSpec(mode, backbone, input_size, seed,
-pretrained, label)` y saltea lo terminado. El notebook arma un corte por
-pregunta de tesis (`PREGUNTAS`) alrededor de `resized_672_swint` y
-`resized_672_efficientnetb0`, y entrena su unión sin duplicados en el proyecto
-de Comet `tesis_v4`. `METRIC_TO_MAXIMIZE=pr_auc` y
+pretrained, label)` y saltea lo terminado. El notebook agrupa las corridas por
+pregunta de tesis (`PREGUNTAS`: pregunta → grupo → corridas) y entrena su unión
+sin duplicados en el proyecto de Comet `tesis_v4`. El nombre de cada corrida
+siempre termina en `_seed{N}` (`resolve_experiment_name`). `METRIC_TO_MAXIMIZE=pr_auc` y
 `USE_CUSTOM_BATCH_SIZE=True`. Los bucles de barrido completo por modo quedan
 comentados y también pasan por `plan.run`.
 
 - `label`: esquema de `dataset/target.py::LABEL_SCHEMES` (A 1–2 vs 3–5, B sin
-  BI-RADS 3, C con 3 negativo). Sufijo `_lbl{x}` en el nombre salvo A.
+  BI-RADS 3, C con 3 negativo). Sufijo `_lbl{x}` en el nombre salvo A, antes
+  de `_seed{N}`.
 - `predictions(spec, split)`: predice el split canónico completo con los
   pesos finales y lo cachea como asset `predictions_{split}.csv` en Comet.
-- `compare`, `evaluate`, `top`, `seed_summary`: siempre sobre las mismas
+- `evaluate`, `pairwise`, `seed_summary`: siempre sobre las mismas
   imágenes y la tarea `PLAN.TASK`, con `ClinicalMetrics` y
-  `PairedBootstrap` (agrupado por `patient_id`).
+  `PairedBootstrap` (agrupado por `patient_id`). `level="breast"` agrega por
+  mama (`BreastAggregation`: máximo entre vistas por estudio y lateralidad);
+  `evaluate(..., ci=True)` suma el IC 95 % por paciente de cada corrida.
+- `ClinicalMetrics.compute(y, p, threshold=)`: ROC-AUC, PR-AUC,
+  PR-AUC/prevalencia, sensibilidad a especificidad 90/95 %, precisión a recall
+  80 %, Brier, ECE y, con umbral, sensibilidad, especificidad, PPV, NPV, F1 y
+  exactitud balanceada. El umbral es el Youden de val al mismo nivel.
+- Cada corrida loguea en Comet esas métricas para val y test, por imagen
+  (`{split}_*`) y por mama (`{split}_breast_*`), la curva `calibration_{split}`
+  y, en test, `test_roc_auc_ci_*` / `test_pr_auc_ci_*` (bootstrap por paciente,
+  `PLAN.BOOTSTRAP_SAMPLES` muestras).
 - `pairwise`: todas contra todas, con diferencia e IC 95 % por par, sin elegir.
 - `unique(specs)`: deduplica por nombre conservando el orden; `by_cost` ordena
   de lo más barato a lo más caro.
 - `timing(specs)`: horas reales (`training_wall_seconds`) frente al costo
   estimado, y reestimación de lo que falta.
-- `PLAN.ALIASES` mapea nombres canónicos a corridas viejas de Comet (no se usa
-  en `tesis_v4`).
+- `status_table(specs, preguntas=)` / `publish_status(...)`: una fila por
+  corrida (incluidas las pendientes) con `status`, `status_code`, `progress`,
+  horas y métricas. `run_all` la sube antes y después de cada corrida como
+  asset `estado_matriz.csv` (se pisa) del experimento `PLAN.STATUS_EXPERIMENT`
+  (default `estado_matriz`, tag `estado`), con métricas `runs_*`, `hours_done`
+  y `matrix_progress` (avance ponderado por costo).
+- Cada corrida loguea en su experimento `run_status` (other), `run_status_code`
+  y `run_progress` (métricas; el avance es sobre las épocas planificadas de las
+  tres etapas) y las coordenadas `matrix_backbone`, `matrix_arch`,
+  `matrix_seed`, `matrix_label`. Códigos: −1 `failed`, 0 `pending`, 1
+  `partial`, 2 `training`, 3 `evaluating`, 4 `done`.
 - Cada corrida loguea `LABEL*`, `EVAL_TASK` y `PROVENANCE_*` (commit de `src`,
   hash de splits y de config, versiones de Python/TF/Keras/comet_ml y GPU); el
   plan falla si hay leakage de paciente.
@@ -84,8 +105,7 @@ Si la sesión se corta, volver a correr el notebook:
   sigue desde la última época (`initial_epoch`) y el log sigue en el mismo
   experimento de Comet (`experiment_key` + `mode="get"`).
 - Con `RESUME.SKIP_IF_IN_COMET`, una corrida terminada en Comet con el mismo
-  nombre cuenta como hecha (opcionalmente solo desde `RESUME.COMET_DONE_SINCE`);
-  sus pesos se bajan de Comet si hace falta transferirlos.
+  nombre cuenta como hecha; sus pesos se bajan de Comet si hace falta transferirlos.
 
 Se restauran pesos, learning rate y contadores de EarlyStopping y
 ReduceLROnPlateau; los momentos de Adam no.
@@ -112,6 +132,6 @@ rendimiento de mamografía completa sale de `standard`, `resized` y los modos AB
 ## Estado
 
 Las corridas de `tesis_v3` (incluido el dump de Comet del 2026-09-07 con
-`simple` / `full` y checkpoint `auc`) son anteriores a la matriz anclada. La
-tabla de cortes y lo que falta entrenar están en el README del workspace
+`simple` / `full` y checkpoint `auc`) son anteriores a la matriz actual. La
+matriz y lo que falta entrenar están en el README del workspace
 `TesisV4`.

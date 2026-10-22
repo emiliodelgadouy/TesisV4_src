@@ -178,6 +178,8 @@ def resolve_resized_input_sizes(
     Lee ``CONFIG["RESIZED"]["INPUT_SIZES"]``. Acepta enteros o pares ``(H, W)``.
     ``INPUT_SIZE`` (singular) es un atajo de un solo elemento.
     Si no hay lista, usa 3× el tamaño nativo del backbone.
+    Con ``native_size`` solo quedan los canvases mayores al nativo en alto y
+    ancho: RESIZED existe para dar más resolución que STANDARD.
     """
     resized = dict(config.get("RESIZED") or {})
     raw = resized.get("INPUT_SIZES")
@@ -195,7 +197,14 @@ def resolve_resized_input_sizes(
         if size not in seen:
             unique.append(size)
             seen.add(size)
-    return unique
+    if native_size is None:
+        return unique
+    native_h, native_w = normalize_input_size(native_size)
+    larger = [(h, w) for h, w in unique if h > native_h and w > native_w]
+    if not larger:
+        pretty = ", ".join(resized_size_label(size) for size in unique)
+        raise ValueError(f"Ningún canvas RESIZED ({pretty}) es mayor que el tamaño nativo {native_h}x{native_w}.")
+    return larger
 
 
 def resolve_resized_input_size(
@@ -213,6 +222,9 @@ def resolve_resized_input_size(
         raise ValueError(f"RESIZED define varios tamaños ({pretty}); pasa input_size=... o usa un nombre resized_<H>.")
     size = normalize_input_size(requested)
     if size not in allowed:
+        if native_size is not None and size in resolve_resized_input_sizes(config):
+            native_h, native_w = normalize_input_size(native_size)
+            raise ValueError(f"Tamaño RESIZED {resized_size_label(size)} no es mayor que el nativo del backbone ({native_h}x{native_w}); usar STANDARD.")
         pretty = ", ".join(resized_size_label(item) for item in allowed)
         raise ValueError(f"Tamaño RESIZED {resized_size_label(size)} no esta en la lista discreta: {pretty}.")
     return size

@@ -14,6 +14,29 @@ _STAGE_EPOCH_KEYS = {
 }
 
 
+def training_progress(config, stages: dict) -> float:
+    """Avance del entrenamiento en [0, 1] sobre las epocas planificadas de las tres etapas.
+
+    ``stages``: ``{stage: (epochs_done, finished)}``. Una etapa terminada cuenta
+    completa aunque EarlyStopping la haya cortado antes.
+    """
+    planned = {stage: max(int(config["TRAINING"][key]), 0) for stage, key in _STAGE_EPOCH_KEYS.items()}
+    total = sum(planned.values())
+    if total == 0:
+        return 1.0
+    done = 0
+    for stage, epochs in planned.items():
+        epochs_done, finished = stages.get(stage, (0, False))
+        done += epochs if finished else min(int(epochs_done), epochs)
+    return done / total
+
+
+def stages_from_state(state: dict | None) -> dict:
+    """``{stage: (epochs_done, finished)}`` desde el estado de resume."""
+    stages = (state or {}).get("stages") or {}
+    return {int(stage): (int(info.get("epochs_done") or 0), bool(info.get("finished"))) for stage, info in stages.items()}
+
+
 class TrainingStageRunner:
     """Ejecuta una etapa de congelamiento con metricas de tiempo reales (wall-clock)."""
 
@@ -82,6 +105,7 @@ class TrainingStageRunner:
         fit_t0 = time.perf_counter()
         callbacks = list(extra_callbacks or [])
         if experiment is not None:
+            previous = {earlier: (0, True) for earlier in _STAGE_EPOCH_KEYS if earlier < stage}
             callbacks.insert(
                 0,
                 CometEpochLogger(
@@ -89,6 +113,7 @@ class TrainingStageRunner:
                     epoch_offset=epoch_offset,
                     stage=stage,
                     monitor=getattr(model, "checkpoint_monitor", None),
+                    progress_fn=lambda epochs_done: training_progress(config, {**previous, stage: (epochs_done, False)}),
                 ),
             )
         if resume is not None:
