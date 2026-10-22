@@ -32,6 +32,7 @@ import hashlib
 import io
 import json
 import subprocess
+import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ import comet_ml
 import numpy as np
 import pandas as pd
 
+from src.backbones import get_backbone
 from src.dataset.target import DEFAULT_LABEL, LABEL_SCHEMES, apply_label_scheme, birads_of
 from src.tracking.comet import RUN_STATUS_CODES
 from src.tracking.comet_results import CometRunIndex
@@ -68,6 +70,8 @@ SEED_SUMMARY_METRICS = (
     "brier",
     "ece",
 )
+# Fraccion de FLOPs en atencion de ViT-S/16 a 224: N / (6 D) con N=196 tokens, D=384.
+ATTENTION_FLOPS_SHARE_NATIVE = 196 / (6 * 384)
 PREDICTION_COLUMNS = ("image_id", "patient_id", "study_id", "laterality", "view", "birads")
 
 
@@ -114,11 +118,19 @@ class RunSpec:
 
     @property
     def estimated_cost(self) -> float:
-        """Costo relativo a ``standard`` a 224 (pixeles procesados por imagen)."""
+        """Costo relativo a ``standard`` a 224 (pixeles procesados por imagen).
+
+        En backbones con atencion global (ViT) la atencion crece con el cuadrado
+        de los tokens, asi que RESIZED cuesta mas que el area.
+        """
         mode = TrainingMode.parse(self.mode)
         if mode == TrainingMode.RESIZED:
             height, width = normalize_input_size(self.input_size or 672)
-            return height * width / (224 * 224)
+            area = height * width / (224 * 224)
+            if get_backbone(self.backbone).batch_memory_scale == "attention":
+                share = ATTENTION_FLOPS_SHARE_NATIVE
+                return area * (1 + share * area) / (1 + share)
+            return area
         if mode == TrainingMode.ABMIL:
             return 9.0
         if mode == TrainingMode.ABMIL_PATCH_HARDNEG:
@@ -217,6 +229,15 @@ def _sha1(payload) -> str:
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
 
 
+def log_table_asset(api_exp, table: pd.DataFrame, name: str) -> None:
+    """Sube ``table`` como CSV ``name`` (se pisa) sin dejar nada en disco:
+    ``APIExperiment.log_asset`` solo acepta una ruta."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / name
+        table.to_csv(path, index=False)
+        api_exp.log_asset(str(path), name=name, overwrite=True)
+
+
 def _task_scheme(task) -> dict:
     if isinstance(task, str):
         return LABEL_SCHEMES[task.upper()]
@@ -239,7 +260,6 @@ class ExperimentPlan:
         self.task = plan_cfg.get("TASK", DEFAULT_LABEL)
         self.bootstrap_samples = int(plan_cfg.get("BOOTSTRAP_SAMPLES", 1000))
         self.weights_cache = Path(plan_cfg.get("WEIGHTS_CACHE", "checkpoints/comet"))
-        self.predictions_dir = Path(plan_cfg.get("PREDICTIONS_DIR", "predictions"))
         # Experimento de Comet con la tabla de estado de la matriz; None/"" lo apaga.
         self.status_experiment_name = plan_cfg.get("STATUS_EXPERIMENT", "estado_matriz")
         self._status_exp = None
@@ -419,10 +439,7 @@ class ExperimentPlan:
             return table
         try:
             exp = self._status_experiment()
-            self.predictions_dir.mkdir(parents=True, exist_ok=True)
-            path = self.predictions_dir / "estado_matriz.csv"
-            table.to_csv(path, index=False)
-            exp.log_asset(str(path), name="estado_matriz.csv", overwrite=True)
+            log_table_asset(exp, table, "estado_matriz.csv")
             counts = table["status"].value_counts()
             cost = table["cost"].astype(float)
             exp.log_metrics(
@@ -442,6 +459,22 @@ class ExperimentPlan:
         except Exception as exc:
             print(f"[plan] no pude publicar el estado en Comet ({type(exc).__name__}: {exc})")
         return table
+
+    def publish_report(self, table: pd.DataFrame, name: str) -> bool:
+        """Sube una tabla del reporte como asset ``name`` (se pisa) del experimento
+        ``PLAN.STATUS_EXPERIMENT``. En Colab no se guarda nada en disco: si falla,
+        avisa y la tabla sigue en memoria para reintentar."""
+        if not self.status_experiment_name or table is None or table.empty:
+            return False
+        try:
+            exp = self._status_experiment()
+            log_table_asset(exp, table, name)
+            exp.log_other(f"{Path(name).stem}_updated_at", datetime.now().astimezone().isoformat(timespec="seconds"))
+        except Exception as exc:
+            print(f"[plan] no pude subir {name} a Comet ({type(exc).__name__}: {exc}); reintentar con plan.publish_report")
+            return False
+        print(f"[plan] {name} en Comet ({self.status_experiment_name})")
+        return True
 
     # ------------------------------------------------------------------ correr
 
@@ -479,22 +512,29 @@ class ExperimentPlan:
         )
 
     def _fresh_status(self, spec: RunSpec) -> tuple[str, dict | None]:
-        """Relee el estado: otra sesion (o un intento fallido en esta) pudo haberlo cambiado."""
+        """Relee el estado de lo no terminado: otra sesion (o un intento fallido en
+        esta) pudo haberlo cambiado. Lo terminado no vuelve atras y no se relee."""
+        status, summary = self.status(spec)
+        if status in ("done", "comet"):
+            return status, summary
         store = self._store(spec)
         if store is not None:
             store.reload()
         return self.status(spec)
 
     def run(self, spec: RunSpec) -> dict:
+        return self._run(spec, *self._fresh_status(spec))
+
+    def _run(self, spec: RunSpec, status: str, summary: dict | None) -> dict:
         name = self.name(spec)
-        status, summary = self._fresh_status(spec)
         if status in ("done", "comet"):
             print(f"[plan] {name}: ya terminada ({status}); se saltea")
             return summary
         print(f"\n[plan] {name}: {'retomo' if status == 'partial' else 'arranco'}")
         config = self._config_for(spec)
-        RandomSeeds.set(config)
         pretrained = self.trained_builder(spec.pretrained) if spec.pretrained is not None else None
+        # Despues del encoder: armarlo o entrenarlo consume estado aleatorio.
+        RandomSeeds.set(config)
         experiment = self._experiment(spec, config, pretrained_builder=pretrained, return_summary=True)
         try:
             experiment.run()
@@ -514,11 +554,12 @@ class ExperimentPlan:
         self.publish_status(specs, preguntas=preguntas)
         for spec in specs:
             name = self.name(spec)
-            pending = self._fresh_status(spec)[0] not in ("done", "comet")
+            status, summary = self._fresh_status(spec)
+            pending = status not in ("done", "comet")
             if pending:
                 self.publish_status(specs, preguntas=preguntas, running=spec)
             try:
-                self.run(spec)
+                self._run(spec, status, summary)
                 self.failures.pop(name, None)
             except Exception as exc:
                 if not continue_on_error:
@@ -668,11 +709,8 @@ class ExperimentPlan:
             cached["image_id"] = cached["image_id"].astype(str)
             cached["birads"] = birads_of(frame).to_numpy()
             cached["y_prob"] = y_prob
-            self.predictions_dir.mkdir(parents=True, exist_ok=True)
-            path = self.predictions_dir / f"{self.name(spec)}_{asset_name}"
-            cached.to_csv(path, index=False)
             if api_exp is not None:
-                api_exp.log_asset(str(path), name=asset_name)
+                log_table_asset(api_exp, cached, asset_name)
         order = frame["image_id"].astype(str).to_numpy()
         cached = cached.drop_duplicates("image_id").set_index("image_id").loc[order].reset_index()
         self._predictions[key] = cached

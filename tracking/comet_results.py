@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ _SUMMARY_METRICS = (
     "thr_youden",
     "training_wall_seconds",
 )
+# Un pedido ``fresh`` relista el proyecto solo si el listado tiene mas de esto;
+# ``forget`` (una corrida de esta sesion cambio) relista siempre.
+REFRESH_SECONDS = 60.0
 
 
 def _slug(value: str) -> str:
@@ -46,7 +50,9 @@ class CometRunIndex:
         self.workspace = comet_cfg.get("WORKSPACE")
         self.project_name = comet_cfg["PROJECT_NAME"]
         self._api = None
+        self._project: tuple[str, str] | None = None
         self._by_name: dict[str, list] | None = None
+        self._listed_at: float | None = None
         self._finished: dict[str, dict | None] = {}
 
     @property
@@ -56,20 +62,30 @@ class CometRunIndex:
         return self._api
 
     def _resolve_project(self) -> tuple[str, str]:
-        workspace = self.workspace or self.api.get_default_workspace()
-        for item in self.api.get(workspace) or []:
-            name = item if isinstance(item, str) else getattr(item, "name", str(item))
-            if name == self.project_name or _slug(name) == _slug(self.project_name):
-                return workspace, name
-        return workspace, self.project_name
+        if self._project is None:
+            workspace = self.workspace or self.api.get_default_workspace()
+            project = self.project_name
+            for item in self.api.get(workspace) or []:
+                name = item if isinstance(item, str) else getattr(item, "name", str(item))
+                if name == self.project_name or _slug(name) == _slug(self.project_name):
+                    project = name
+                    break
+            self._project = (workspace, project)
+        return self._project
 
     def refresh(self) -> None:
+        """Un solo listado del proyecto. Lo terminado se conserva; lo no terminado se vuelve a mirar."""
         workspace, project = self._resolve_project()
         by_name: dict[str, list] = {}
-        for exp in self.api.get_experiments(workspace, project) or []:
+        # Sin ``pattern`` la API indexa por nombre y deja un solo experimento por
+        # nombre; con ``pattern`` indexa por key y devuelve todos.
+        for exp in self.api.get_experiments(workspace, project, pattern=".*") or []:
             by_name.setdefault(str(exp.name), []).append(exp)
+        for experiments in by_name.values():
+            experiments.sort(key=lambda exp: int(exp.start_server_timestamp or 0), reverse=True)
         self._by_name = by_name
-        self._finished = {}
+        self._listed_at = time.monotonic()
+        self._finished = {name: summary for name, summary in self._finished.items() if summary is not None}
 
     def forget(self, name: str) -> None:
         """Invalida lo cacheado para ``name`` (p. ej. despues de correrla en esta sesion)."""
@@ -77,20 +93,21 @@ class CometRunIndex:
         self._by_name = None
 
     def _candidates(self, name: str) -> list:
+        """``(start_ms, started, exp)`` con ese nombre, el mas nuevo primero (sin pedidos extra)."""
         if self._by_name is None:
             self.refresh()
         rows = []
         for exp in self._by_name.get(name, []):
-            meta = exp.get_metadata() or {}
-            start_ms = int(meta.get("startTimeMillis") or 0)
+            start_ms = int(exp.start_server_timestamp or 0)
             started = datetime.fromtimestamp(start_ms / 1000).astimezone() if start_ms else None
             rows.append((start_ms, started, exp))
-        rows.sort(key=lambda row: row[0], reverse=True)
         return rows
 
     def experiments_named(self, name: str, *, fresh: bool = False) -> list:
-        """Experimentos no archivados con ese nombre, el mas nuevo primero."""
-        if fresh:
+        """Experimentos no archivados con ese nombre, el mas nuevo primero.
+
+        ``fresh`` relista si el listado tiene mas de ``REFRESH_SECONDS``."""
+        if fresh and (self._listed_at is None or time.monotonic() - self._listed_at >= REFRESH_SECONDS):
             self._by_name = None
         return [exp for _, _, exp in self._candidates(name)]
 

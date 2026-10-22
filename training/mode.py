@@ -350,14 +350,14 @@ def resolve_batch_size(
 
     Despues escala por ``RESIZED.INPUT_SIZES`` / ``ABMIL.BAG_GRID`` para no OOM,
     salvo que ``RESIZED.BATCH_SIZES`` fije el batch del canvas (mismo valor para
-    todos los backbones).
+    todos los backbones). Con batch custom, ese valor queda acotado por el batch
+    escalado del backbone (p. ej. ViT a 672 usa 8 aunque la tabla diga 64).
     Devuelve ``(batch_size, source, batch_size_base)``.
     """
     mode = TrainingMode.parse(mode)
+    explicit = None
     if mode == TrainingMode.RESIZED and input_size is not None:
         explicit = resolve_resized_batch_size(config, input_size)
-        if explicit is not None:
-            return explicit, "resized", explicit
     general = config["GENERAL"]
     memory_scale = "spatial"
     try:
@@ -401,4 +401,8 @@ def resolve_batch_size(
         bag_grid=bag_grid,
         memory_scale=memory_scale,
     )
+    if explicit is not None:
+        if source == "backbone" and scaled < explicit:
+            return scaled, "backbone", int(base)
+        return explicit, "resized", explicit
     return scaled, source, int(base)

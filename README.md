@@ -76,6 +76,10 @@ comentados y también pasan por `plan.run`.
   asset `estado_matriz.csv` (se pisa) del experimento `PLAN.STATUS_EXPERIMENT`
   (default `estado_matriz`, tag `estado`), con métricas `runs_*`, `hours_done`
   y `matrix_progress` (avance ponderado por costo).
+- `publish_report(table, name)`: sube una tabla del reporte como asset `name`
+  (se pisa) del mismo experimento. Nada queda en disco: `log_table_asset`
+  escribe un CSV temporal porque `APIExperiment.log_asset` necesita una ruta;
+  las predicciones recalculadas suben igual como `predictions_{split}.csv`.
 - Cada corrida loguea en su experimento `run_status` (other), `run_status_code`
   y `run_progress` (métricas; el avance es sobre las épocas planificadas de las
   tres etapas) y las coordenadas `matrix_backbone`, `matrix_arch`,
@@ -119,7 +123,8 @@ resize o del canvas. El batch de referencia de cada backbone cabe en una A100
 80GB (mixed_float16, etapa 3) a tamaño nativo, RESIZED 672 y ABMIL 3×3;
 `resolve_batch_size()` lo escala si el canvas o la grilla cambian.
 `RESIZED.BATCH_SIZES` y `RESIZED.CACHE`, cuando existen, pisan ese cálculo para
-todos los backbones.
+todos los backbones; con `USE_CUSTOM_BATCH_SIZE`, el batch de la tabla no supera
+el escalado del backbone (ViT-S/16 a 672 usa 8).
 
 Los checkpoints quedan en `checkpoints/` como
 `{prefix}_stage_{n}_epoch{NN}.weights.h5`. El prefix es `{modo}_{backbone}`, o
