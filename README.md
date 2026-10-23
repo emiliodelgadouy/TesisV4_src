@@ -38,15 +38,27 @@ con `PATCH_HARDNEG.ALIGN_TO_BAG_GRID=True`.
 
 ## Contrato del notebook
 
-El driver de `multirun.ipynb` es una matriz de experimentos (`training/plan.py`):
-`ExperimentPlan` corre una lista de `RunSpec(mode, backbone, input_size, seed,
-pretrained, label)` y saltea lo terminado. El notebook agrupa las corridas por
-pregunta de tesis (`PREGUNTAS`: pregunta → grupo → corridas) y entrena su unión
-sin duplicados en el proyecto de Comet `tesis_v4`. El nombre de cada corrida
-siempre termina en `_seed{N}` (`resolve_experiment_name`). `METRIC_TO_MAXIMIZE=pr_auc` y
-`USE_CUSTOM_BATCH_SIZE=True`. Los bucles de barrido completo por modo quedan
-comentados y también pasan por `plan.run`.
+`multirun.ipynb` no usa `ExperimentPlan`: define una función `train_experiment` que
+arma el nombre (`notebook_api.experiment_name`), saltea lo que
+`CometRunIndex.finished` ya tiene terminado y si no llama a
+`run_training_experiment` con un `CometRunStore` para el resume. El resumen lee
+las métricas logueadas de cada corrida terminada (`CometRunIndex.names` +
+`finished_metrics`). El nombre de cada corrida siempre termina en `_seed{N}`
+(`resolve_experiment_name`). `METRIC_TO_MAXIMIZE=pr_auc` y
+`USE_CUSTOM_BATCH_SIZE=True`.
 
+`TrainingExperiment` falla si un paciente o estudio cae en dos splits y loguea
+por su cuenta `LABEL`, `EVAL_TASK` y `PROVENANCE_*`
+(`training/provenance.py`), salvo que ya vengan en `GENERAL` (como hace
+`ExperimentPlan`). `predictions_{split}.csv` siempre lleva `birads`.
+
+`ExperimentPlan` (`training/plan.py`, lo usa `optuna_swint672.ipynb`) corre
+`RunSpec(mode, backbone, input_size, seed, pretrained, label)` salteando lo
+terminado:
+
+- `finished_specs(modes=)`: corridas terminadas (no archivadas) del proyecto de
+  Comet como `RunSpec`, reconstruidas desde el nombre (`spec_from_name`, que
+  solo acepta nombres que el plan vuelve a generar igual).
 - `label`: esquema de `dataset/target.py::LABEL_SCHEMES` (A 1–2 vs 3–5, B sin
   BI-RADS 3, C con 3 negativo). Sufijo `_lbl{x}` en el nombre salvo A, antes
   de `_seed{N}`.
@@ -70,7 +82,7 @@ comentados y también pasan por `plan.run`.
   de lo más barato a lo más caro.
 - `timing(specs)`: horas reales (`training_wall_seconds`) frente al costo
   estimado, y reestimación de lo que falta.
-- `status_table(specs, preguntas=)` / `publish_status(...)`: una fila por
+- `status_table(specs)` / `publish_status(specs)`: una fila por
   corrida (incluidas las pendientes) con `status`, `status_code`, `progress`,
   horas y métricas. `run_all` la sube antes y después de cada corrida como
   asset `estado_matriz.csv` (se pisa) del experimento `PLAN.STATUS_EXPERIMENT`

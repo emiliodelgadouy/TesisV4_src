@@ -9,10 +9,12 @@ import numpy as np
 from src.backbones import get_backbone, resolve_backbone
 from src.dataset.provider import build_dataset_provider
 from src.dataset.splits import SplitManager
+from src.dataset.target import DEFAULT_LABEL, birads_of
 from src.model_builder import ModelBuilder, ModelBuilderFactory
 from src.tracking.comet import CometTracker
 from src.training.evaluator import BreastAggregation, ClinicalMetrics, Predictor, ThresholdSelector
 from src.training.mode import TrainingMode, resized_size_label, resolve_abmil_config, resolve_batch_size, resolve_resized_cache
+from src.training.provenance import check_split_leakage, provenance
 from src.training.resources import GpuResources
 from src.training.resume import TrainingResume, epochs_completed
 from src.training.stage_runner import TrainingStageRunner, stages_from_state, training_progress
@@ -94,6 +96,8 @@ class TrainingExperiment:
         val_df = self.val_df
         test_df = self.test_df
         pretrained_builder = self.pretrained_builder
+        frames = {"train": train_df, "val": val_df, "test": test_df}
+        check_split_leakage(frames)
 
         general = config["GENERAL"]
         training = config["TRAINING"]
@@ -224,6 +228,10 @@ class TrainingExperiment:
                 "FOCAL_ALPHA_EFFECTIVE": focal_alpha,
                 "INITIAL_BIAS_EFFECTIVE": bias,
             }
+            run_config.setdefault("LABEL", DEFAULT_LABEL)
+            run_config.setdefault("EVAL_TASK", run_config["LABEL"])
+            if "PROVENANCE_SRC_COMMIT" not in run_config:
+                run_config.update(provenance(config, frames))
             run_config.update(
                 builder_cls.extra_run_config(config, native_size=native_size, input_size=input_size)
             )
@@ -558,6 +566,11 @@ class TrainingExperiment:
             return
         columns = [column for column in ("image_id", "patient_id", "study_id", "laterality", "view", "birads") if column in table.columns]
         frame = table[columns].reset_index(drop=True).copy()
+        if "birads" not in frame.columns:
+            try:
+                frame["birads"] = birads_of(table).to_numpy()
+            except KeyError:
+                pass
         frame["y_prob"] = np.asarray(y_prob, dtype=np.float64)
         experiment.log_asset_data(frame.to_csv(index=False), name=f"predictions_{split_name}.csv", overwrite=True)
 

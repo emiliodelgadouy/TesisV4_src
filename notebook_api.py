@@ -16,13 +16,17 @@ import comet_ml  # noqa: F401 - antes de TensorFlow
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import copy
+
 
 from src.dataset.preparer import DatasetPreparer
 from src.dataset.provider import build_dataset_provider
 from src.dataset.splits import SplitManager
 from src.tracking.comet import CometTracker
+from src.tracking.comet_results import CometRunIndex
+from src.tracking.comet_store import CometRunStore
 from src.training.evaluator import PairedBootstrap, Predictor, ThresholdSelector
-from src.training.experiment import TrainingExperiment
+from src.training.experiment import TrainingExperiment, resolve_experiment_name
 from src.training.inference import predict_with_weights
 from src.training.mode import resolve_resized_input_sizes
 from src.training.plan import ExperimentPlan, RunSpec, prepare_resume
@@ -93,6 +97,11 @@ def paired_auc_delta(y_true, prob_ref, prob_alt, *, groups=None, samples: int = 
     return PairedBootstrap.auc_delta(y_true, prob_ref, prob_alt, groups=groups, samples=samples, seed=seed)
 
 
+def experiment_name(config, mode, backbone_name, *, input_size=None) -> str:
+    """Nombre de la corrida en Comet (``resized_672_swint_seed42``; la semilla sale de ``GENERAL.RANDOM_SEED``)."""
+    return resolve_experiment_name(config, mode, backbone_name, input_size=input_size)[0]
+
+
 def resized_input_sizes(config, backbone_name=None):
     """Lista discreta de canvases RESIZED (enteros o pares del CONFIG)."""
     native_size = None
@@ -104,13 +113,17 @@ def resized_input_sizes(config, backbone_name=None):
 
 
 __all__ = [
+    "copy",
     "np",
     "pd",
     "tf",
+    "CometRunIndex",
+    "CometRunStore",
     "ExperimentPlan",
     "RunSpec",
     "apply_probability_threshold",
     "build_dataset_provider",
+    "experiment_name",
     "get_dataset_splits",
     "login_comet",
     "paired_auc_delta",

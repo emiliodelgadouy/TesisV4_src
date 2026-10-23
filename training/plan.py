@@ -28,10 +28,8 @@ Contrastable:
 from __future__ import annotations
 
 import copy
-import hashlib
 import io
-import json
-import subprocess
+import re
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -50,6 +48,7 @@ from src.training.evaluator import BreastAggregation, ClinicalMetrics, PairedBoo
 from src.training.experiment import TrainingExperiment, resolve_experiment_name
 from src.training.inference import build_trained_model, predict_dataframe
 from src.training.mode import TrainingMode, normalize_input_size, resized_size_label
+from src.training.provenance import check_split_leakage, provenance
 from src.training.resources import GpuResources, RandomSeeds
 from src.training.resume import RunStore
 from src.training.stage_runner import stages_from_state, training_progress
@@ -73,6 +72,7 @@ SEED_SUMMARY_METRICS = (
 # Fraccion de FLOPs en atencion de ViT-S/16 a 224: N / (6 D) con N=196 tokens, D=384.
 ATTENTION_FLOPS_SHARE_NATIVE = 196 / (6 * 384)
 PREDICTION_COLUMNS = ("image_id", "patient_id", "study_id", "laterality", "view", "birads")
+_RUN_NAME = re.compile(r"^(?P<prefix>.+?)(?:_lbl(?P<label>[a-z]+))?_seed(?P<seed>\d+)$")
 
 
 @dataclass(frozen=True)
@@ -189,46 +189,6 @@ def prepare_resume(config) -> str | None:
     return target
 
 
-def src_commit() -> str:
-    """Commit de ``src`` (con ``-dirty`` si hay cambios sin commitear)."""
-    src_dir = Path(__file__).resolve().parents[1]
-    try:
-        head = subprocess.run(["git", "-C", str(src_dir), "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(src_dir), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True, check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    return f"{head}-dirty" if dirty else head
-
-
-def environment() -> dict[str, str]:
-    """Versiones y GPU del entorno. En Colab no se instalan los requirements: la
-    version de TensorFlow la decide Colab, asi que se registra por corrida."""
-    import platform
-
-    import comet_ml
-    import keras
-    import tensorflow as tf
-
-    gpus = tf.config.list_physical_devices("GPU")
-    gpu_names = []
-    for gpu in gpus:
-        try:
-            gpu_names.append(str(tf.config.experimental.get_device_details(gpu).get("device_name") or gpu.name))
-        except Exception:
-            gpu_names.append(gpu.name)
-    return {
-        "PROVENANCE_PYTHON": platform.python_version(),
-        "PROVENANCE_TENSORFLOW": tf.__version__,
-        "PROVENANCE_KERAS": keras.__version__,
-        "PROVENANCE_COMET_ML": comet_ml.__version__,
-        "PROVENANCE_GPU": ", ".join(gpu_names) or "cpu",
-    }
-
-
-def _sha1(payload) -> str:
-    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
-
-
 def log_table_asset(api_exp, table: pd.DataFrame, name: str) -> None:
     """Sube ``table`` como CSV ``name`` (se pisa) sin dejar nada en disco:
     ``APIExperiment.log_asset`` solo acepta una ruta."""
@@ -267,12 +227,7 @@ class ExperimentPlan:
         self._summaries: dict[str, dict] = {}
         self._predictions: dict[tuple[str, str], pd.DataFrame] = {}
         self.failures: dict[str, str] = {}
-        self.provenance = {
-            "PROVENANCE_SRC_COMMIT": src_commit(),
-            "PROVENANCE_SPLIT_SHA1": self._split_sha1(),
-            "PROVENANCE_CONFIG_SHA1": _sha1({key: value for key, value in config.items() if key != "COMET"}),
-            **environment(),
-        }
+        self.provenance = provenance(config, self.frames)
         if train_df is not None:
             missing = [name for name, frame in self.frames.items() if "image_id" not in frame.columns]
             if missing:
@@ -281,24 +236,9 @@ class ExperimentPlan:
 
     # ------------------------------------------------------------------ splits
 
-    def _split_sha1(self) -> str | None:
-        if any(frame is None for frame in self.frames.values()):
-            return None
-        return _sha1({name: sorted(frame["image_id"].astype(str)) for name, frame in self.frames.items() if "image_id" in frame.columns})
-
     def check_splits(self) -> pd.DataFrame:
         """Falla si un paciente/estudio cae en dos splits; devuelve conteos por esquema."""
-        for column in ("patient_id", "study_id"):
-            if not all(column in frame.columns for frame in self.frames.values()):
-                continue
-            groups = {name: set(frame[column].astype(str)) for name, frame in self.frames.items()}
-            overlaps = {
-                f"{a}∩{b}": len(groups[a] & groups[b])
-                for a, b in (("train", "val"), ("train", "test"), ("val", "test"))
-                if groups[a] & groups[b]
-            }
-            if overlaps:
-                raise ValueError(f"Leakage de {column} entre splits: {overlaps}")
+        check_split_leakage(self.frames)
         rows = []
         for key, scheme in LABEL_SCHEMES.items():
             for split, frame in self.frames.items():
@@ -367,19 +307,12 @@ class ExperimentPlan:
             return 0.0
         return training_progress(self.config, stages_from_state(store.load()))
 
-    def status_table(self, specs, *, preguntas=None, running: RunSpec | None = None) -> pd.DataFrame:
+    def status_table(self, specs, *, running: RunSpec | None = None) -> pd.DataFrame:
         """Una fila por corrida con estado, avance y resultados, para la vista de monitoreo.
 
         ``status``: ``pending`` | ``training`` (la que corre ahora) | ``partial``
-        (cortada, se retoma) | ``failed`` | ``done``. ``preguntas``: ``{pregunta:
-        {grupo: [RunSpec]}}`` (o ``{pregunta: [RunSpec]}``).
+        (cortada, se retoma) | ``failed`` | ``done``.
         """
-        por_nombre: dict[str, dict] = {}
-        for pregunta, grupos in (preguntas or {}).items():
-            listas = grupos.values() if isinstance(grupos, dict) else [grupos]
-            for lista in listas:
-                for spec in lista:
-                    por_nombre.setdefault(self.name(spec), {})[pregunta] = None
         running_name = self.name(running) if running is not None else None
         rows = []
         for spec in specs:
@@ -401,7 +334,6 @@ class ExperimentPlan:
                     "arch": spec.arch,
                     "seed": spec.seed if spec.seed is not None else self.config["GENERAL"]["RANDOM_SEED"],
                     "label": spec.label_key,
-                    "preguntas": ", ".join(por_nombre.get(name, {})),
                     "status": status,
                     "status_code": RUN_STATUS_CODES[status],
                     "progress": round(progress, 4),
@@ -430,11 +362,11 @@ class ExperimentPlan:
                 self.comet.forget(name)
         return self._status_exp
 
-    def publish_status(self, specs, *, preguntas=None, running: RunSpec | None = None) -> pd.DataFrame:
+    def publish_status(self, specs, *, running: RunSpec | None = None) -> pd.DataFrame:
         """Sube la tabla de estado como asset ``estado_matriz.csv`` (se pisa) y metricas
         agregadas (``runs_*``, ``hours_done``, ``matrix_progress``) al experimento
         ``PLAN.STATUS_EXPERIMENT``. Un error de red no corta la matriz."""
-        table = self.status_table(specs, preguntas=preguntas, running=running)
+        table = self.status_table(specs, running=running)
         if not self.status_experiment_name or table.empty:
             return table
         try:
@@ -543,21 +475,21 @@ class ExperimentPlan:
         self._remember(name, experiment.summary)
         return self._summaries.get(name, {})
 
-    def run_all(self, specs, *, continue_on_error: bool = False, preguntas=None) -> pd.DataFrame:
+    def run_all(self, specs, *, continue_on_error: bool = False) -> pd.DataFrame:
         """Corre en orden. Con ``continue_on_error`` un fallo (p. ej. OOM) se anota en
         ``failures`` y se sigue con la siguiente; al volver a correr se reintenta.
 
         Antes y despues de cada corrida publica la tabla de estado en Comet
-        (``publish_status``); ``preguntas`` agrega la columna de preguntas.
+        (``publish_status``).
         """
         specs = list(specs)
-        self.publish_status(specs, preguntas=preguntas)
+        self.publish_status(specs)
         for spec in specs:
             name = self.name(spec)
             status, summary = self._fresh_status(spec)
             pending = status not in ("done", "comet")
             if pending:
-                self.publish_status(specs, preguntas=preguntas, running=spec)
+                self.publish_status(specs, running=spec)
             try:
                 self._run(spec, status, summary)
                 self.failures.pop(name, None)
@@ -568,11 +500,11 @@ class ExperimentPlan:
                 print(f"[plan] {name}: FALLO, sigo con la siguiente ({self.failures[name][:300]})")
             finally:
                 if pending:
-                    self.publish_status(specs, preguntas=preguntas)
+                    self.publish_status(specs)
         failed = [self.name(spec) for spec in specs if self.name(spec) in self.failures]
         if failed:
             print(f"[plan] {len(failed)} corridas fallaron en esta sesion: {failed}")
-        return self.status_table(specs, preguntas=preguntas)
+        return self.status_table(specs)
 
     @staticmethod
     def by_cost(specs) -> list[RunSpec]:
@@ -586,6 +518,54 @@ class ExperimentPlan:
         for spec in specs:
             seen.setdefault(self.name(spec), spec)
         return list(seen.values())
+
+    def spec_from_name(self, name: str) -> RunSpec | None:
+        """``RunSpec`` de un nombre de experimento (``resized_672_swint_seed42``), o None.
+
+        Solo vale si el plan vuelve a generar exactamente ese nombre: un canvas que
+        ya no esta en ``RESIZED.INPUT_SIZES`` o un sufijo ajeno (p. ej. ``hpo*``) no cuenta.
+        """
+        match = _RUN_NAME.match(str(name))
+        if match is None:
+            return None
+        prefix, label, seed = match.group("prefix"), match.group("label"), int(match.group("seed"))
+        if label is not None and label.upper() not in LABEL_SCHEMES:
+            return None
+        input_size = None
+        if prefix.startswith("resized_"):
+            size, _, backbone = prefix[len("resized_") :].partition("_")
+            mode = TrainingMode.RESIZED
+            height, _, width = size.partition("x")
+            if not height.isdigit() or (width and not width.isdigit()):
+                return None
+            input_size = int(height) if not width else (int(height), int(width))
+        else:
+            mode = next((mode for mode in sorted(TrainingMode.ALL, key=len, reverse=True) if prefix.startswith(f"{mode}_")), None)
+            if mode is None:
+                return None
+            backbone = prefix[len(mode) + 1 :]
+        pretrained = RunSpec(TrainingMode.PATCH_HARDNEG, backbone) if mode == TrainingMode.ABMIL_PATCH_HARDNEG else None
+        spec = RunSpec(mode, backbone, input_size=input_size, seed=seed, pretrained=pretrained, label=label.upper() if label else None)
+        try:
+            return spec if self.name(spec) == name else None
+        except Exception:
+            return None
+
+    def finished_specs(self, modes=None) -> list[RunSpec]:
+        """Corridas terminadas (no archivadas) del proyecto de Comet, como ``RunSpec``.
+
+        Sale del listado de Comet, no de una lista armada en el notebook: sirve para
+        resumir todo lo que ya existe. ``modes`` filtra por modo (``["standard", "resized"]``).
+        """
+        wanted = {TrainingMode.parse(mode) for mode in modes} if modes is not None else None
+        specs = []
+        for name in self.comet.names(fresh=True):
+            spec = self.spec_from_name(name)
+            if spec is None or (wanted is not None and TrainingMode.parse(spec.mode) not in wanted):
+                continue
+            if self.lookup(spec) is not None:
+                specs.append(spec)
+        return sorted(specs, key=lambda spec: (TrainingMode.ALL.index(TrainingMode.parse(spec.mode)), spec.backbone, spec.estimated_cost, spec.seed, spec.label_key))
 
     def timing(self, specs, *, hours_per_cost: float | None = None) -> pd.DataFrame:
         """Horas reales de entrenamiento (``training_wall_seconds``) vs el costo estimado.

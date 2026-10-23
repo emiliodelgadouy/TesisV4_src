@@ -54,6 +54,7 @@ class CometRunIndex:
         self._by_name: dict[str, list] | None = None
         self._listed_at: float | None = None
         self._finished: dict[str, dict | None] = {}
+        self._metrics: dict[str, dict[str, float]] = {}
 
     @property
     def api(self):
@@ -90,6 +91,7 @@ class CometRunIndex:
     def forget(self, name: str) -> None:
         """Invalida lo cacheado para ``name`` (p. ej. despues de correrla en esta sesion)."""
         self._finished.pop(name, None)
+        self._metrics.pop(name, None)
         self._by_name = None
 
     def _candidates(self, name: str) -> list:
@@ -102,6 +104,16 @@ class CometRunIndex:
             started = datetime.fromtimestamp(start_ms / 1000).astimezone() if start_ms else None
             rows.append((start_ms, started, exp))
         return rows
+
+    def names(self, *, fresh: bool = False) -> list[str]:
+        """Nombres de los experimentos no archivados del proyecto.
+
+        ``fresh`` relista si el listado tiene mas de ``REFRESH_SECONDS``."""
+        if fresh and (self._listed_at is None or time.monotonic() - self._listed_at >= REFRESH_SECONDS):
+            self._by_name = None
+        if self._by_name is None:
+            self.refresh()
+        return sorted(self._by_name)
 
     def experiments_named(self, name: str, *, fresh: bool = False) -> list:
         """Experimentos no archivados con ese nombre, el mas nuevo primero.
@@ -131,9 +143,19 @@ class CometRunIndex:
                 value = _as_float(metrics.get(key))
                 if value is not None:
                     found[key] = value
+            self._metrics[name] = {key: value for key, value in ((key, _as_float(raw)) for key, raw in metrics.items()) if value is not None}
             break
         self._finished[name] = found
         return found
+
+    def finished_metrics(self, name: str) -> dict[str, float] | None:
+        """Ultimo valor de cada metrica de la corrida terminada mas reciente con ese nombre, o None."""
+        if self.finished(name) is None:
+            return None
+        if name not in self._metrics:
+            self._finished.pop(name, None)
+            self.finished(name)
+        return self._metrics.get(name)
 
     def download_final_weights(self, name: str, dest_dir: str | Path) -> Path:
         """Baja ``{name}_final_weights`` (``log_model``) de la corrida terminada mas reciente."""
